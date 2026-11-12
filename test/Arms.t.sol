@@ -44,7 +44,21 @@ contract ArmsTest is ArmsBase {
         Arms.Params memory p = sepoliaParams(address(token), address(court));
         p.maxTotalBonded = 30 ether;
         p.maxBondPerArm = 30 ether;
-        Arms small = new Arms(p);
+        Arms small = new Arms(
+            p.token,
+            p.court,
+            p.minFeePerArm,
+            p.maxBondPerArm,
+            p.maxTotalBonded,
+            p.trancheMultiple,
+            p.burnBps,
+            p.challengerRewardBps,
+            p.commitWindow,
+            p.revealWindow,
+            p.challengeWindow,
+            p.courtDeadline,
+            p.exitDelay
+        );
         vm.startPrank(poster);
         token.approve(address(small), type(uint256).max);
         small.bond(25 ether);
@@ -57,15 +71,57 @@ contract ArmsTest is ArmsBase {
         Arms.Params memory p = sepoliaParams(address(token), address(court));
         p.trancheMultiple = 2; // the first slash could not cover the refund
         vm.expectRevert(Arms.BadParams.selector);
-        new Arms(p);
+        new Arms(
+            p.token,
+            p.court,
+            p.minFeePerArm,
+            p.maxBondPerArm,
+            p.maxTotalBonded,
+            p.trancheMultiple,
+            p.burnBps,
+            p.challengerRewardBps,
+            p.commitWindow,
+            p.revealWindow,
+            p.challengeWindow,
+            p.courtDeadline,
+            p.exitDelay
+        );
         p = sepoliaParams(address(token), address(court));
         p.burnBps = 10_001;
         vm.expectRevert(Arms.BadParams.selector);
-        new Arms(p);
+        new Arms(
+            p.token,
+            p.court,
+            p.minFeePerArm,
+            p.maxBondPerArm,
+            p.maxTotalBonded,
+            p.trancheMultiple,
+            p.burnBps,
+            p.challengerRewardBps,
+            p.commitWindow,
+            p.revealWindow,
+            p.challengeWindow,
+            p.courtDeadline,
+            p.exitDelay
+        );
         p = sepoliaParams(address(token), address(court));
-        p.chainA = 0;
+        p.court = address(0);
         vm.expectRevert(Arms.BadParams.selector);
-        new Arms(p);
+        new Arms(
+            p.token,
+            p.court,
+            p.minFeePerArm,
+            p.maxBondPerArm,
+            p.maxTotalBonded,
+            p.trancheMultiple,
+            p.burnBps,
+            p.challengerRewardBps,
+            p.commitWindow,
+            p.revealWindow,
+            p.challengeWindow,
+            p.courtDeadline,
+            p.exitDelay
+        );
     }
 
     function test_withdraw_onlyUnlocked() public {
@@ -91,14 +147,13 @@ contract ArmsTest is ArmsBase {
         vm.prank(a);
         arms.setSigner(signer);
         vm.prank(b);
-        vm.expectRevert(Arms.SignerTaken.selector);
         arms.setSigner(signer);
         bytes32[] memory v = _vals("truth");
         vm.prank(signer);
-        arms.commit(id, keccak256(abi.encode(id, a, v, _salt(a))));
+        arms.commit(id, a, keccak256(abi.encode(id, a, v, _salt(a))));
         _commit(id, b, v);
         vm.prank(signer);
-        arms.reveal(id, v, _salt(a), "ipfs://e");
+        arms.reveal(id, a, v, _salt(a), "ipfs://e");
         _reveal(id, b, v);
         // The signer may only commit and reveal: it has no bond of its own to withdraw.
         vm.prank(signer);
@@ -107,18 +162,23 @@ contract ArmsTest is ArmsBase {
         // A stranger cannot act for the arm.
         vm.prank(makeAddr("stranger"));
         vm.expectRevert(Arms.NotOnJob.selector);
-        arms.commit(id, bytes32(0));
-        // Clearing the signer frees it.
+        arms.commit(id, a, bytes32(0));
+        // Clearing this arm's signer leaves the other arm's delegation intact.
         vm.prank(a);
         arms.setSigner(address(0));
-        assertEq(arms.armOfSigner(signer), address(0));
+        assertEq(_arm(a).signer, address(0));
+        assertEq(_arm(b).signer, signer);
     }
 
     // ------------------------------------------------------------------ forms
 
     function test_registerForm_rules() public {
         vm.expectRevert(Arms.FormExists.selector);
-        arms.registerForm(formId, 2, "x");
+        arms.registerForm(
+            keccak256("Arms form v1: four questions about a target contract"),
+            KEYS,
+            "ipfs://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi/form.md"
+        );
         vm.expectRevert(Arms.BadForm.selector);
         arms.registerForm(keccak256("f2"), 0, "x");
         vm.expectRevert(Arms.BadForm.selector);
@@ -133,8 +193,8 @@ contract ArmsTest is ArmsBase {
         arms.registerForm(keccak256("f2"), 1, unicode"ipfs://é");
         vm.expectRevert(Arms.BadForm.selector);
         arms.registerForm(keccak256("f2"), 1, 'has"quote');
-        arms.registerForm(keccak256("f2"), 32, "ipfs://ok");
-        (uint8 kc, string memory uri) = arms.forms(keccak256("f2"));
+        bytes32 f2 = arms.registerForm(keccak256("f2"), 32, "ipfs://ok");
+        (uint8 kc, string memory uri) = arms.formRegistry().forms(f2);
         assertEq(kc, 32);
         assertEq(uri, "ipfs://ok");
     }
@@ -147,18 +207,19 @@ contract ArmsTest is ArmsBase {
         vm.expectRevert(Arms.FeeTooLow.selector);
         arms.serve(formId, FEE - 1);
         arms.serve(formId, 2 * FEE);
-        assertEq(arms.minFeeOf(formId, a), 2 * FEE);
-        assertEq(arms.serversOf(formId).length, 6);
+        assertEq(arms.formRegistry().minFeeOf(formId, a), 2 * FEE);
+        assertEq(arms.formRegistry().serversOf(formId).length, 6);
         arms.stopServing(formId);
-        assertEq(arms.serversOf(formId).length, 5);
-        assertEq(arms.minFeeOf(formId, a), 0);
+        assertEq(arms.formRegistry().serversOf(formId).length, 6);
+        assertEq(arms.formRegistry().minFeeOf(formId, a), 2 * FEE);
+        assertGt(arms.formRegistry().stoppedAt(formId, a), 0);
         vm.expectRevert(Arms.UnknownForm.selector);
         arms.stopServing(formId);
         vm.stopPrank();
-        // The swap-remove kept the others addressable.
+        // Stopping leaves every address at its permanent index.
         vm.prank(armSet[5]);
         arms.stopServing(formId);
-        assertEq(arms.serversOf(formId).length, 4);
+        assertEq(arms.formRegistry().serversOf(formId).length, 6);
     }
 
     // ------------------------------------------------------------------ jobs
@@ -215,25 +276,24 @@ contract ArmsTest is ArmsBase {
         vm.prank(armSet[1]);
         arms.serve(formId, 5 * FEE);
         _fund(armSet[0], 0 ether);
+        vm.roll(vm.getBlockNumber() + 1);
         vm.prank(armSet[0]);
         uint256 id = arms.post(formId, CHAIN, target, AT_BLOCK, FEE);
         vm.roll(vm.getBlockNumber() + 2);
-        vm.expectRevert(Arms.NoCandidates.selector);
         arms.draw(id);
-        // An exiting arm is skipped too.
+        // A fee update after posting is excluded from that job too.
         vm.prank(armSet[1]);
         arms.serve(formId, FEE);
         vm.prank(armSet[1]);
         arms.requestExit();
-        vm.expectRevert(Arms.NoCandidates.selector);
         arms.draw(id);
-        // One eligible arm fills one of two seats; the job stays open for the second.
+        // Re-serving after posting cannot join the old snapshot.
         vm.prank(armSet[2]);
         arms.serve(formId, FEE);
         arms.draw(id);
         Arms.Job memory j = _job(id);
         if (j.needed == 2) {
-            assertEq(arms.armsOf(id).length, 1);
+            assertEq(arms.armsOf(id).length, 0);
             assertEq(uint8(j.phase), uint8(Arms.Phase.OPEN));
         }
     }
@@ -273,36 +333,36 @@ contract ArmsTest is ArmsBase {
         bytes32[] memory v = _vals("truth");
         vm.prank(poster);
         vm.expectRevert(Arms.NotOnJob.selector);
-        arms.commit(id, bytes32(0));
+        arms.commit(id, a, bytes32(0));
         // Reveal before all committed is the wrong phase.
         _commit(id, a, v);
         vm.prank(a);
         vm.expectRevert(Arms.WrongPhase.selector);
-        arms.reveal(id, v, _salt(a), "");
+        arms.reveal(id, a, v, _salt(a), "");
         vm.prank(a);
         vm.expectRevert(Arms.AlreadyCommitted.selector);
-        arms.commit(id, bytes32(0));
+        arms.commit(id, a, bytes32(0));
         _commit(id, b, v);
         assertEq(uint8(_job(id).phase), uint8(Arms.Phase.REVEAL));
         // Wrong salt, wrong length, then a good reveal, then a repeat.
         vm.prank(a);
         vm.expectRevert(Arms.BadReveal.selector);
-        arms.reveal(id, v, bytes32(0), "");
+        arms.reveal(id, a, v, bytes32(0), "");
         bytes32[] memory short = new bytes32[](KEYS - 1);
         vm.prank(a);
         vm.expectRevert(Arms.BadReveal.selector);
-        arms.reveal(id, short, _salt(a), "");
+        arms.reveal(id, a, short, _salt(a), "");
         _reveal(id, a, v);
         vm.prank(a);
         vm.expectRevert(Arms.AlreadyRevealed.selector);
-        arms.reveal(id, v, _salt(a), "");
+        arms.reveal(id, a, v, _salt(a), "");
         vm.expectRevert(Arms.NotPending.selector);
         arms.settle(id);
         // Too late for b.
         vm.warp(vm.getBlockTimestamp() + 2 hours + 1);
         vm.prank(b);
         vm.expectRevert(Arms.TooLate.selector);
-        arms.reveal(id, v, _salt(b), "");
+        arms.reveal(id, b, v, _salt(b), "");
     }
 
     function test_timeout_commitMissStrikesAndReplaces() public {
@@ -482,12 +542,12 @@ contract ArmsTest is ArmsBase {
         tv[0] = va[2];
         // Wrong length is refused; then commit and reveal only the disputed key.
         vm.prank(tb);
-        arms.commit(id, keccak256(abi.encode(id, tb, tv, _salt(tb))));
+        arms.commit(id, tb, keccak256(abi.encode(id, tb, tv, _salt(tb))));
         assertEq(uint8(_job(id).phase), uint8(Arms.Phase.TIE_REVEAL));
         bytes32[] memory wrongLen = new bytes32[](2);
         vm.prank(tb);
         vm.expectRevert(Arms.BadReveal.selector);
-        arms.reveal(id, wrongLen, _salt(tb), "");
+        arms.reveal(id, tb, wrongLen, _salt(tb), "");
         uint256 tbBefore = token.balanceOf(tb);
         uint256 aBefore = token.balanceOf(drawn[0]);
         uint256 bBefore = token.balanceOf(drawn[1]);
@@ -503,16 +563,15 @@ contract ArmsTest is ArmsBase {
         assertEq(vd.tieBreaker, tb);
     }
 
-    function test_settle_tieBreakTimeoutsStrikeAndUnresolvedWhenNobodyCanBeDrawn() public {
-        // Four servers: two arms and two possible tie breakers.
-        for (uint256 i = 4; i < 6; ++i) {
+    function test_settle_unavailableTieBreakLeavesDisputedKeysUnresolved() public {
+        for (uint256 i = 2; i < 6; ++i) {
             vm.prank(armSet[i]);
             arms.stopServing(formId);
         }
         uint256 id = _post();
         _fill(id);
         address[] memory drawn = arms.armsOf(id);
-        vm.assume(drawn.length == 2);
+        assertEq(drawn.length, 2);
         bytes32[] memory va = _vals("truth");
         bytes32[] memory vb = _vals("other");
         _commit(id, drawn[0], va);
@@ -521,39 +580,26 @@ contract ArmsTest is ArmsBase {
         _reveal(id, drawn[1], vb);
         arms.settle(id);
         assertEq(_job(id).disputedCount, KEYS);
-        _fillTie(id);
-        address tb = _job(id).tieBreaker;
-        // Tie breaker misses the commit: struck, job back to TIE_OPEN.
-        vm.warp(vm.getBlockTimestamp() + 6 hours + 1);
-        arms.timeout(id);
-        assertEq(_arm(tb).strikes, 1);
-        assertEq(uint8(_job(id).phase), uint8(Arms.Phase.TIE_OPEN));
-        // A replaced arm is never redrawn for the same job: the other candidate comes in and misses the reveal.
-        _fillTie(id);
-        address tb2 = _job(id).tieBreaker;
-        assertTrue(tb2 != tb, "struck tie breaker not redrawn");
-        bytes32[] memory tv = new bytes32[](KEYS);
-        vm.prank(tb2);
-        arms.commit(id, keccak256(abi.encode(id, tb2, tv, _salt(tb2))));
-        vm.warp(vm.getBlockTimestamp() + 2 hours + 1);
-        arms.timeout(id);
-        assertEq(_arm(tb2).strikes, 1);
-        // Nobody is left to draw; after fillDeadline the job settles with the disputed keys UNRESOLVED.
         vm.roll(vm.getBlockNumber() + 2);
-        vm.expectRevert(Arms.NoCandidates.selector);
         arms.draw(id);
+        assertEq(uint8(_job(id).phase), uint8(Arms.Phase.TIE_OPEN));
         vm.expectRevert(Arms.TooEarly.selector);
         arms.settle(id);
         vm.warp(vm.getBlockTimestamp() + 1 days + 1);
-        uint256 posterBefore = token.balanceOf(poster);
+        uint256 before = token.balanceOf(poster);
         arms.settle(id);
-        Arms.Verdict memory vd = arms.verdict(id);
         for (uint256 k; k < KEYS; ++k) {
-            assertEq(uint8(vd.statuses[k]), uint8(Arms.Status.UNRESOLVED));
+            assertEq(uint8(arms.verdict(id).statuses[k]), uint8(Arms.Status.UNRESOLVED));
         }
-        assertEq(token.balanceOf(poster) - posterBefore, 3 * FEE, "nothing paid, all returned");
-        assertEq(_arm(tb).locked, 0);
-        assertEq(_arm(tb2).locked, 0);
+        assertEq(token.balanceOf(poster) - before, 3 * FEE);
+        for (uint256 i; i < drawn.length; ++i) {
+            assertEq(_arm(drawn[i]).strikes, 0);
+        }
+        vm.warp(vm.getBlockTimestamp() + 7 days + 1);
+        arms.release(id);
+        for (uint256 i; i < drawn.length; ++i) {
+            assertEq(_arm(drawn[i]).locked, 0);
+        }
     }
 
     function test_spotCheck_threeArmsMajorityWithoutTieBreak() public {
@@ -844,16 +890,16 @@ contract ArmsTest is ArmsBase {
         address a = arms.armsOf(id)[0];
         bytes32[] memory v = _vals(tweak);
         vm.prank(a);
-        arms.commit(id, keccak256(abi.encode(id, a, v, salt)));
+        arms.commit(id, a, keccak256(abi.encode(id, a, v, salt)));
         address b = arms.armsOf(id)[1];
         _commit(id, b, v);
         if (_job(id).phase != Arms.Phase.REVEAL) return;
         bytes32[] memory other = _vals(~tweak);
         vm.prank(a);
         vm.expectRevert(Arms.BadReveal.selector);
-        arms.reveal(id, other, salt, "");
+        arms.reveal(id, a, other, salt, "");
         vm.prank(a);
-        arms.reveal(id, v, salt, "");
+        arms.reveal(id, a, v, salt, "");
     }
 
     function testFuzz_settlePaymentsNeverExceedEscrow(bytes32 sa, bytes32 sb, uint8 agreeMask) public {

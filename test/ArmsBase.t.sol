@@ -35,8 +35,10 @@ abstract contract ArmsBase is Test {
         vm.roll(1000);
         token = new MockToken(tokenOwner);
         court = new MockCourt(address(token), COURT_FEE);
-        arms = new Arms(sepoliaParams(address(token), address(court)));
-        arms.registerForm(formId, KEYS, "ipfs://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi/form.md");
+        arms = _deploy(sepoliaParams(address(token), address(court)));
+        formId = arms.registerForm(
+            formId, KEYS, "ipfs://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi/form.md"
+        );
         for (uint256 i; i < 6; ++i) {
             address a = makeAddr(string.concat("arm", vm.toString(i)));
             _fund(a, 1000 ether);
@@ -54,25 +56,34 @@ abstract contract ArmsBase is Test {
         p.token = token_;
         p.court = court_;
         p.trancheMultiple = 10;
-        p.stakeMultiple = 2;
         p.minFeePerArm = FEE;
-        p.minBond = 20 * FEE;
         p.maxBondPerArm = 1000 ether;
         p.maxTotalBonded = 100_000 ether;
         p.burnBps = 1000;
         p.challengerRewardBps = 3000;
-        p.spotCheckOneIn = 10;
         p.commitWindow = 6 hours;
         p.revealWindow = 2 hours;
-        p.fillDeadline = 1 days;
         p.challengeWindow = 7 days;
         p.courtDeadline = 7 days;
         p.exitDelay = 14 days;
-        p.strikesToDeactivate = 3;
-        p.strikeCooldown = 1 days;
-        p.chainA = 11155111;
-        p.chainB = 4663;
-        p.arbitrumBlocks = false;
+    }
+
+    function _deploy(Arms.Params memory p) internal returns (Arms) {
+        return new Arms(
+            p.token,
+            p.court,
+            p.minFeePerArm,
+            p.maxBondPerArm,
+            p.maxTotalBonded,
+            p.trancheMultiple,
+            p.burnBps,
+            p.challengerRewardBps,
+            p.commitWindow,
+            p.revealWindow,
+            p.challengeWindow,
+            p.courtDeadline,
+            p.exitDelay
+        );
     }
 
     function _fund(address who, uint256 amount) internal {
@@ -98,6 +109,7 @@ abstract contract ArmsBase is Test {
     }
 
     function _post() internal returns (uint256 id) {
+        vm.roll(vm.getBlockNumber() + 1);
         vm.prank(poster);
         id = arms.post(formId, CHAIN, target, AT_BLOCK, FEE);
     }
@@ -151,12 +163,12 @@ abstract contract ArmsBase is Test {
 
     function _commit(uint256 id, address a, bytes32[] memory v) internal {
         vm.prank(a);
-        arms.commit(id, keccak256(abi.encode(id, a, v, _salt(a))));
+        arms.commit(id, a, keccak256(abi.encode(id, a, v, _salt(a))));
     }
 
     function _reveal(uint256 id, address a, bytes32[] memory v) internal {
         vm.prank(a);
-        arms.reveal(id, v, _salt(a), string.concat("ipfs://evidence/", vm.toString(a)));
+        arms.reveal(id, a, v, _salt(a), string.concat("ipfs://evidence/", vm.toString(a)));
     }
 
     /// @dev Every drawn arm commits then reveals `v`.

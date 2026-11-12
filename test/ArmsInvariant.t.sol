@@ -18,7 +18,7 @@ contract ArmsHandler is Test {
     Arms public arms;
     MockToken public token;
     MockCourt public court;
-    bytes32 public formId = keccak256("invariant form");
+    bytes32 public formId = keccak256(abi.encode(keccak256("invariant form"), uint8(3), "ipfs://form"));
     address[] public actors;
     uint256[] public jobIds;
     uint256 public initialSupply;
@@ -31,11 +31,13 @@ contract ArmsHandler is Test {
     mapping(uint256 => mapping(uint8 => Arms.Status)) public finalStatus;
     bytes32[] public openCases;
 
-    constructor(Arms arms_, MockToken token_, MockCourt court_, address[] memory actors_) {
+    constructor(Arms arms_, MockToken token_, MockCourt court_) {
         arms = arms_;
         token = token_;
         court = court_;
-        actors = actors_;
+        for (uint256 i; i < 8; ++i) {
+            actors.push(makeAddr(string.concat("actor", vm.toString(i))));
+        }
         initialSupply = token.totalSupply();
     }
 
@@ -105,7 +107,7 @@ contract ArmsHandler is Test {
         address a = _actor(who);
         Arms.ArmInfo memory s = _arm(a);
         if (!s.inactive) return;
-        vm.warp(uint256(s.deactivatedAt) + 1 days);
+        if (vm.getBlockTimestamp() < uint256(s.deactivatedAt) + 1 days) vm.warp(uint256(s.deactivatedAt) + 1 days);
         vm.prank(a);
         arms.reactivate();
     }
@@ -113,6 +115,7 @@ contract ArmsHandler is Test {
     function post(uint256 who) external {
         address p = _actor(who);
         if (token.balanceOf(p) < 3 * FEE) return;
+        vm.roll(vm.getBlockNumber() + 1);
         vm.prank(p);
         uint256 id = arms.post(formId, 11155111, address(0xBEEF), 100, FEE);
         jobIds.push(id);
@@ -155,21 +158,21 @@ contract ArmsHandler is Test {
                 bytes32[] memory v = _values(i, mode, KEYS);
                 if (mode == 2 && i == 0) allUnknown[id][drawn[i]] = true;
                 vm.prank(drawn[i]);
-                arms.commit(id, keccak256(abi.encode(id, drawn[i], v, bytes32(uint256(i)))));
+                arms.commit(id, drawn[i], keccak256(abi.encode(id, drawn[i], v, bytes32(uint256(i)))));
             }
             for (uint256 i; i < drawn.length; ++i) {
                 if (mode == 3 && i == 0) continue;
                 bytes32[] memory v = _values(i, mode, KEYS);
                 vm.prank(drawn[i]);
-                arms.reveal(id, v, bytes32(uint256(i)), "ipfs://e");
+                arms.reveal(id, drawn[i], v, bytes32(uint256(i)), "ipfs://e");
             }
         } else if (j.phase == Arms.Phase.TIE_COMMIT) {
             bytes32[] memory v = _values(mode % 2, mode == 2 ? 0 : mode, j.disputedCount);
             vm.prank(j.tieBreaker);
-            arms.commit(id, keccak256(abi.encode(id, j.tieBreaker, v, bytes32(0))));
+            arms.commit(id, j.tieBreaker, keccak256(abi.encode(id, j.tieBreaker, v, bytes32(0))));
             if (mode == 3) return;
             vm.prank(j.tieBreaker);
-            arms.reveal(id, v, bytes32(0), "ipfs://tb");
+            arms.reveal(id, j.tieBreaker, v, bytes32(0), "ipfs://tb");
         }
     }
 
@@ -191,7 +194,7 @@ contract ArmsHandler is Test {
         if (id == 0) return;
         Arms.Job memory j = _job(id);
         if (j.deadline == 0) return;
-        vm.warp(uint256(j.deadline) + 1);
+        if (vm.getBlockTimestamp() <= j.deadline) vm.warp(uint256(j.deadline) + 1);
         (bool ok,) = address(arms).call(abi.encodeWithSelector(arms.timeout.selector, id));
         ok;
     }
@@ -201,7 +204,7 @@ contract ArmsHandler is Test {
         if (id == 0) return;
         Arms.Job memory j = _job(id);
         if (j.phase != Arms.Phase.OPEN) return;
-        vm.warp(uint256(j.openSince) + 1 days + 1);
+        if (vm.getBlockTimestamp() <= uint256(j.openSince) + 1 days) vm.warp(uint256(j.openSince) + 1 days + 1);
         uint256 before = token.balanceOf(j.poster);
         arms.cancel(id);
         posterGot[id] += token.balanceOf(j.poster) - before;
@@ -211,7 +214,9 @@ contract ArmsHandler is Test {
         uint256 id = _pick(seed);
         if (id == 0) return;
         Arms.Job memory j = _job(id);
-        if (j.phase == Arms.Phase.TIE_OPEN) vm.warp(uint256(j.openSince) + 1 days + 1);
+        if (j.phase == Arms.Phase.TIE_OPEN && vm.getBlockTimestamp() <= uint256(j.openSince) + 1 days) {
+            vm.warp(uint256(j.openSince) + 1 days + 1);
+        }
         address[] memory drawn = arms.armsOf(id);
         uint256[] memory before = new uint256[](drawn.length);
         for (uint256 i; i < drawn.length; ++i) {
@@ -259,7 +264,10 @@ contract ArmsHandler is Test {
             arms.challenges(caseId);
         if (!exists || resolved) return;
         Arms.Job memory j = _job(id);
-        if (court.rulingOf(address(arms), caseId) == ICourt.Ruling.NONE) vm.warp(uint256(openedAt) + 7 days + 1);
+        if (
+            court.rulingOf(address(arms), caseId) == ICourt.Ruling.NONE
+                && vm.getBlockTimestamp() <= uint256(openedAt) + 7 days
+        ) vm.warp(uint256(openedAt) + 7 days + 1);
         address[] memory drawn = arms.armsOf(id);
         uint256[] memory bondBefore = new uint256[](drawn.length + 1);
         for (uint256 i; i < drawn.length; ++i) {
@@ -295,7 +303,7 @@ contract ArmsHandler is Test {
         if (id == 0) return;
         Arms.Job memory j = _job(id);
         if (j.phase != Arms.Phase.SETTLED || j.openChallenges != 0 || j.released) return;
-        vm.warp(uint256(j.challengeEnd) + 1);
+        if (vm.getBlockTimestamp() <= j.challengeEnd) vm.warp(uint256(j.challengeEnd) + 1);
         arms.release(id);
     }
 
@@ -330,27 +338,33 @@ contract ArmsInvariantTest is Test {
         p.token = address(token);
         p.court = address(court);
         p.trancheMultiple = 10;
-        p.stakeMultiple = 2;
         p.minFeePerArm = FEE;
-        p.minBond = 20 * FEE;
         p.maxBondPerArm = 1000 ether;
         p.maxTotalBonded = 100_000 ether;
         p.burnBps = 1000;
         p.challengerRewardBps = 3000;
-        p.spotCheckOneIn = 10;
         p.commitWindow = 6 hours;
         p.revealWindow = 2 hours;
-        p.fillDeadline = 1 days;
         p.challengeWindow = 7 days;
         p.courtDeadline = 7 days;
         p.exitDelay = 14 days;
-        p.strikesToDeactivate = 3;
-        p.strikeCooldown = 1 days;
-        p.chainA = 11155111;
-        p.chainB = 4663;
-        arms = new Arms(p);
+        arms = new Arms(
+            p.token,
+            p.court,
+            p.minFeePerArm,
+            p.maxBondPerArm,
+            p.maxTotalBonded,
+            p.trancheMultiple,
+            p.burnBps,
+            p.challengerRewardBps,
+            p.commitWindow,
+            p.revealWindow,
+            p.challengeWindow,
+            p.courtDeadline,
+            p.exitDelay
+        );
         bytes32 formId = keccak256("invariant form");
-        arms.registerForm(formId, 3, "ipfs://form");
+        formId = arms.registerForm(formId, 3, "ipfs://form");
         address[] memory actors = new address[](8);
         for (uint256 i; i < actors.length; ++i) {
             actors[i] = makeAddr(string.concat("actor", vm.toString(i)));
@@ -362,7 +376,7 @@ contract ArmsInvariantTest is Test {
             arms.serve(formId, FEE);
             vm.stopPrank();
         }
-        handler = new ArmsHandler(arms, token, court, actors);
+        handler = new ArmsHandler(arms, token, court);
         targetContract(address(handler));
     }
 

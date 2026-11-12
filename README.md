@@ -1,156 +1,264 @@
 # Arms v1
 
-Bonded agents called *arms* answer a fixed form (1 to 32 keys, one `bytes32` per key) about a target
-contract. Two sealed answers are compared key by key; where they differ a tie break arm decides. After
-settlement anyone can challenge a key, and an IdentityMD (IMD) oracle panel rules through `IMDCourt`.
+Bonded agents (*arms*) answer an immutable form about a target contract. A job escrows three fees,
+normally draws two arms, compares sealed answers key by key, and uses one tie breaker when necessary.
+One job in ten instead draws a blind third arm. Challenges go to an IdentityMD oracle panel.
 
-There is **no owner, admin, upgrade or pause** in the core. Every number is an immutable constructor
-argument. The token is used only through `transfer`, `transferFrom`, `balanceOf` and `burn(uint256)`.
-Anyone can advance any timeout.
+This continuation repairs the launch interface and the reported audit faults. **This job deploys
+nothing, sends no transaction, and mints no token.** The core has no owner, admin, upgrade or pause.
+Existing project tokens must not be replaced or re-minted by a later deployment.
 
-## Contracts (`src/`)
+## Contracts and boundaries
 
-| Contract | Role |
+| Contract | Responsibility |
 | --- | --- |
-| `Arms` | The core: bonds, forms, jobs, draws, commit/reveal, settlement, challenges, reads. |
-| `ICourt` | Rulings interface: `feeAsset`, `fee`, `ask(...)`, `ruling(caseId)`; `Ruling {NONE, STORED, CLAIMED, NEITHER}`. |
-| `IMDCourt` | `ICourt` adapter over the IMD `Intake`: one `oracle.request` per case, EIP-712 attestation verified in the callback. |
-| `MockCourt` | A court anyone can rule for. Tests and local demos only. |
-| `MockToken` | Burnable ERC-20 (`ARMT`) with an owner-only `mint`. The token Arms is bonded and paid in on Sepolia. |
-| `Blocks` | Internal library reading block number and hash; switches to `ArbSys` for Arbitrum Orbit chains (Robinhood Chain later). |
-| `OracleAttestation`, `OracleQuestion` | The protocol's verbatim libraries (from the `oracle-consumer` reference), plus `OracleQuestion.bodyWith` to insert the `consumer` member. One name adapted to OpenZeppelin 5.2 (`isValidSignatureNow`). |
+| `Arms` | Holds all bonds, escrow, stakes and rewards; enforces eligibility, deadlines, authorization, payments and challenges. |
+| `ArmsForms` | Form identity, URI validation and permanent server indices. Only its permanently bound Arms instance can write. |
+| `ArmsResults` | Stateless vote counting, payment calculation and verdict reads. Only performs static reads of its caller. |
+| `ICourt` | `supportsChain`, `feeAsset`, `fee`, `ask`, `ruling`. |
+| `IMDCourt` | Owns the fixed target-chain list and asks Intake v2 for signed, question-bound rulings. |
+| `MockCourt` | Constructor-configured fee; anyone can rule. Local demonstrations/tests only. |
+| `MockToken` | Burnable, 18-decimal ARMT test token; explicit owner controls minting, outside the core. |
+| `Blocks` | Internal block-number/hash adapter; uses ArbSys on recognized Arbitrum chains. |
+| `FormURI` | Internal URI-character validation shared by the registry and court. |
+| `OracleAttestation`, `OracleQuestion` | Protocol attestation and canonical question encoding, with the existing `bodyWith` helper. |
 
-Dependencies are vendored as plain files under `lib/` (forge-std v1.9.6, OpenZeppelin v5.2.0). No submodules.
+Arms creates `ArmsForms` and `ArmsResults` in its constructor and stores their immutable addresses.
+They have no initializer or replacement path. There is no delegatecall, proxy, external library link,
+manual storage packing, or deployment-time call to a configured token, court, Intake or precompile.
+Only the registry stores forms; all funds and job state remain in Arms. Form reads are now on
+`Arms.formRegistry()`: `forms(id)`, `info(id)`, `serversOf(id)`, `minFeeOf(id, arm)`, `stoppedAt(id, arm)`, `stoppedAfterJob(id, arm)`.
+The mutating entry points `registerForm`, `serve` and `stopServing` remain on Arms.
 
-## Launch (Sepolia, chain id 11155111)
+Dependencies and compiler configuration are unchanged. Foundry pins Solidity **0.8.26**, Cancun,
+via-IR, optimizer runs 1. Dependencies are already ordinary files under `lib/`.
 
-IMD's launch deploys the contracts from the bytecode as built; this repository does not broadcast and
-holds no key. Deploy order and constructor arguments (`script/Deploy.s.sol` rehearses the same on a
-local node and `test/Deploy.t.sol` calls it):
+## Later deployment: order and every constructor argument
 
-1. `MockToken(owner_ = $owner)` — `$owner` = `0xcc4e8639884d08033597def041f966e8be5bc514`, the only privileged role (minting), outside the core.
-2. `IMDCourt(intake, asset, action, oracleSigner)` =
-   `0xa43e6f75ee006411f79ac1c84120606c2330de82` (IMD Intake v2),
-   `0x56bcf2a5f47710649a4091219ef0b56e2d1b58bf` (imdTEST, the asset the Sepolia Intake sells `oracle.request` in),
-   `0x6f7261636c652e72657175657374406f7261636c652d31000000000000000000` (`bytes32("oracle.request@oracle-1")`, UTF-8 right-padded, not a hash),
-   `0x5598aa9146215bc13eb26f2c692ad1461fd32982` (the live attester).
-3. `Arms(Params)` with `token = $contract:MockToken`, `court = $contract:IMDCourt` and the parameters below. `Params` is one struct of static words (24 fields); `Arms` emits `Deployed(Params)` once so every value is readable from the logs.
+Every constructor below is nonpayable, accepts at most 16 entries, and takes only addresses, unsigned
+integers or bytes32. No array, tuple/struct, string, bytes or ETH is required. No setup transaction is
+needed to connect or activate the contracts. Token distribution, form registration, bonding and posting
+are ordinary user operations, not contract initialization.
 
-Constructors call no other contract, so they run on an empty chain. Runtime sizes: Arms 23,765 bytes, IMDCourt 11,914 bytes (EIP-170 limit 24,576).
+The accepted Sepolia rehearsal is `script/Deploy.s.sol`. `deploy(Config)` can be tested without an
+RPC, environment variables or any broadcast. Its old `Params` constructor has been removed: `Params`
+is now only a convenient data type for the `Deployed` event and the rehearsal helpers.
 
-**Sepolia addresses and transaction hashes.** They are produced by IMD's launch after this work is
-accepted and are recorded on the launch page, not here: this assignment has no wallet and never
-broadcasts. The one real oracle question on Sepolia is therefore an *after launch* step (below), and its
-transaction hashes are to be added to this section once run.
+1. **Token.** Reuse the project's token if one has been deployed. For the original Sepolia mock-token
+   launch, deploy `MockToken(address owner_)` with the launch's `$owner`, never the deployment factory.
+   The retained rehearsal's owner is `0xcc4e8639884d08033597def041f966e8be5bc514` from the accepted project.
+   `MockToken` has no premint; its owner may distribute test tokens through the normal `mint` function.
+2. **Court.** Deploy `IMDCourt(intake_, asset_, action_, oracleSigner_)` with these four entries in order:
 
-| Item | Value |
-| --- | --- |
-| MockToken | recorded by the launch |
-| IMDCourt | recorded by the launch |
-| Arms | recorded by the launch |
-| Real oracle question (`IMDCourt.ask` tx, request id, callback tx) | to be added after `script/AskSepolia.s.sol` is run |
+   | Argument | Accepted Sepolia parameter |
+   | --- | --- |
+   | `intake_` (address) | `0xa43e6f75ee006411f79ac1c84120606c2330de82`, Intake v2 |
+   | `asset_` (address) | `0x56bcf2a5f47710649a4091219ef0b56e2d1b58bf`, imdTEST |
+   | `action_` (bytes32) | `0x6f7261636c652e72657175657374406f7261636c652d31000000000000000000`, ASCII `oracle.request@oracle-1`, padded rather than hashed |
+   | `oracleSigner_` (address) | `0x5598aa9146215bc13eb26f2c692ad1461fd32982` |
 
-### Parameters
+   These are retained project/reference parameters, not newly selected contracts. The deployer must
+   recheck the published signer, code and live action price before a later launch. Nothing in this
+   assignment asserts that an oracle request has been sent or answered on chain.
+3. **Core.** Deploy `Arms` with exactly these **13 flat entries**, in this order:
 
-| Parameter | Sepolia value | Source |
-| --- | --- | --- |
-| trancheMultiple | 10 (× feePerArm locked per job; ≥ 3 enforced so the first slash always covers the refund) | brief |
-| stakeMultiple | 2 (× feePerArm challenge stake) | brief |
-| minFeePerArm | 1 ARMT (1e18) | chosen: the brief left it open on a test token |
-| minBond | 20 × minFeePerArm = 20 ARMT | brief |
-| maxBondPerArm | 1,000 ARMT | chosen |
-| maxTotalBonded | 100,000 ARMT | chosen |
-| burnBps | 1000 (10% of every payment burned) | brief |
-| challengerRewardBps | 3000 (30% of the first slash after the refund) | brief |
-| spotCheckOneIn | 10 (seed % 10 == 0 draws a blind third arm) | brief |
-| commitWindow / revealWindow | 6 h / 2 h | brief |
-| fillDeadline | 1 day (from the moment a job is, or returns to, OPEN / TIE_OPEN) | brief |
-| challengeWindow / courtDeadline | 7 days / 7 days | brief |
-| exitDelay | 14 days | brief |
-| strikesToDeactivate / strikeCooldown | 3 / 1 day | brief |
-| target chains | 11155111 (Sepolia), 4663 (Robinhood Chain); two unused slots | brief |
-| arbitrumBlocks | false (Sepolia); true on an Arbitrum Orbit deployment | chain |
-| IMDCourt panel / quorum / validForSeconds | 5 / 4 / 86,400 (constants) | brief; 5 is also the Intake's minimum panel |
-| Form URI and evidence URI | ≤ 200 bytes, printable ASCII without `"` or `\` | brief / oracle body rules |
+   | # | Argument | Accepted Sepolia parameter |
+   | --- | --- | --- |
+   | 1 | `token_` address | Existing project token, or the MockToken from step 1 |
+   | 2 | `court_` address | IMDCourt from step 2 |
+   | 3 | `minFeePerArm_` uint256 | `1000000000000000000` (1 ARMT) |
+   | 4 | `maxBondPerArm_` uint256 | `1000000000000000000000` (1,000 ARMT) |
+   | 5 | `maxTotalBonded_` uint256 | `100000000000000000000000` (100,000 ARMT) |
+   | 6 | `trancheMultiple_` uint256 | `10` |
+   | 7 | `burnBps_` uint256 | `1000` |
+   | 8 | `challengerRewardBps_` uint256 | `3000` |
+   | 9 | `commitWindow_` uint256 | `21600` (6 hours) |
+   | 10 | `revealWindow_` uint256 | `7200` (2 hours) |
+   | 11 | `challengeWindow_` uint256 | `604800` (7 days) |
+   | 12 | `courtDeadline_` uint256 | `604800` (7 days) |
+   | 13 | `exitDelay_` uint256 | `1209600` (14 days) |
 
-### Trust assumptions
+   During step 3, Arms first creates `ArmsForms(address core_, uint256 minFee_)` with its own address
+   and argument 3, then `ArmsResults()` with no arguments. These children are automatically deployed;
+   a launch does not deploy or wire separate instances. Their addresses are available from
+   `formRegistry()` and `resultCalculator()` immediately. All creation code is fully linked.
 
-- **Token owner.** `MockToken`'s owner mints at will. It can inflate the test token; it cannot touch Arms' balances or rules. On a real deployment the token is the requester's choice.
-- **Oracle signer.** One hot key (`0x5598…2982`, read from `api.imd.fun/oracle/requests` on 2026-11-12) signs every ruling. It is **fixed at deploy** (the brief forbids an admin); a rotation by IMD requires deploying a new `IMDCourt` *and* a new `Arms`, since Arms' court is immutable too. The IMD docs recommend an owner-settable signer; the brief's "no owner" rule wins and this is the consequence.
-- **Oracle price and liveness.** The court reads `Intake.priceOf` live (0.5 imdTEST today) and refuses a case above the challenger's `maxCourtFee`. If IMD stops selling the action the price reads 0 and `ask` reverts (no challenge can open). A refused body, a disagreeing panel or a lost callback leaves the ruling `NONE`; the case ends at `courtDeadline` with the stake returned and the stored verdict unchanged. The intake refunds nothing.
-- **Block hash seed.** Draws are seeded by `blockhash(seedBlock)` (the block after the post / reopen) and the job id. A block proposer can bias one draw; once the hash is older than 256 blocks the seed moves to the newest available hash, so whoever calls `draw` then can pick the block. This is accepted for v1 and is only as valuable as the fee of one job.
-- **Form text.** `formId` is the keccak256 of the form text published at `uri`; Arms never sees the text. The panel reads it from the URI the form registrar gave.
-- **IMD plane.** The question text, its panel's honesty and the attestation's single signature are IMD's.
+For local demonstrations, `MockCourt(address feeToken_, uint256 price_)` can replace IMDCourt; its
+fee token must already exist. A zero price with a zero fee token is the deliberately free mock mode,
+not a production placeholder. The test-only `MockIntake(address writer_, address treasury_, bytes32
+ action_, address asset_, uint256 price_)` installs its initial sale in its constructor; no `setPrice`
+setup call is needed. Its unrestricted `setPrice` is solely for simulating later price changes in tests.
+The scripts themselves have no constructor arguments. Libraries are internal and need no deployment.
 
-### Differences from the brief and from IMD's documentation
+The five v1 constants are `stakeMultiple = 2`, `spotCheckOneIn = 10`, `strikesToDeactivate = 3`,
+`strikeCooldown = 1 day`, and `fillDeadline = 1 day`. `minBond` is derived as
+`2 * trancheMultiple * minFeePerArm` (20 ARMT above). `trancheMultiple >= 3` is enforced so one
+tranche covers the maximum three-fee poster refund. Basis points are at most 10,000; required fees
+and windows are nonzero; bond caps must cover the derived minimum. All token amounts are raw units.
 
-- `ICourt.ask` keeps the brief's signature, but the court pulls its fee from **`msg.sender`** (Arms), never from the `payer` argument. Arms pulls the fee from the challenger itself and approves the court in the same call. Reason: a `transferFrom` from an arbitrary address is a theft vector and a Slither hard failure (`arbitrary-send-erc20`). `ICourt` gained two views, `feeAsset()` and `fee()`, so Arms can quote and pull the fee first. `payer` is recorded in the case for the record.
-- Cases are namespaced by asker inside the court (`keccak256(asker, caseId)`), so nobody can pre-occupy a case id and block a challenge. `ruling(caseId)` is read by the asker; `rulingOf(asker, caseId)` for anyone else.
-- The oracle body carries `"consumer": <IMDCourt>` as the brief asks; the attestation is signed in IMDCourt's EIP-712 domain. The exact body shape (`POST /requests/check` on 2026-11-12) returned **no blockers**; its suggestions were `not_answerable` (a generic warning for a template with placeholder values) and `evidence` (it proposed `chain` where the brief fixes `panel`). The live Sepolia Intake was read with `priceOf`: imdTEST `0x56bc…58bf` → 0.5e18 (the `0x44a1…f89a` address seen in third-party repos prices at 0 and is not used).
-- IMD's reference makes intake, asset, action and signer owner-settable. The brief says no owner; all four are immutable here.
-- The brief's "deploy to Sepolia with transaction hashes": deployment is IMD's launch step and this worker holds no key, so hashes are not in this commit (see Launch).
+`IMDCourt.supportsChain` accepts **11155111 (Sepolia)** and **4663 (Robinhood Chain)**, preserving the
+accepted list. Arms delegates target-chain admission to the court. This list is separate from the
+chain Arms executes on. Block mode comes from the deployment's `block.chainid`, never bytecode
+presence at a precompile or a constructor flag: 42161, 42170, 421614, 4663 and 46630 use ArbSys at
+address 100; other chains use EVM block numbers/hashes. An additional Orbit chain needs an explicit
+source update before deploying there. The configured deployment here remains Sepolia.
 
-### Behaviour decided where the brief was open
+## Forms, bonds and frozen draws
 
-- A key is **AGREED** when every drawn arm gives the same non-UNKNOWN value; **MAJORITY** when a value has ≥ 2 votes and a unique maximum (three arms 2–1, or after a tie break); **disputed** (tie break) when ≥ 2 distinct non-UNKNOWN values and no majority; **UNRESOLVED** otherwise (all UNKNOWN, or one answer plus UNKNOWN with two arms).
-- A replaced (struck) arm is never redrawn for the same job. A newly drawn replacement after a reveal miss can read the revealed answers on chain; accepted for v1.
-- A tie break nobody can be drawn for by `fillDeadline` settles with the disputed keys UNRESOLVED and the full escrow returned (nothing is paid). `fillDeadline` counts from the job's latest return to OPEN / TIE_OPEN.
-- With a spot-check (three arms) **and** a tie break, entitled payments can exceed the 3 × fee escrow; the tie break arm's payment is capped at what is left.
-- A reward set aside by a NEITHER ruling waits for a CLAIMED ruling until the challenge window closes; `release` burns it if none came (the brief burns it as soon as all open challenges resolve, which would strand a later honest CLAIMED challenger inside the window).
-- `bond()` cancels a pending exit; `withdraw()` keeps the exit flag so an arm can withdraw in several steps.
-- The stake split on STORED gives the dust to the first arm.
+`registerForm(textHash, keyCount, uri)` returns
+`formId = keccak256(abi.encode(textHash, keyCount, uri))`. The same text hash with a different URI
+or key count has a different id and cannot occupy the intended form's id. Registration is idempotent
+only by reverting on an exact duplicate. There are 1–32 keys. URI length is 1–200 bytes, using RFC 3986
+URI characters: ASCII letters/digits, unreserved punctuation and reserved URI punctuation, including
+percent signs. Spaces, controls, double quotes, backslashes and non-ASCII bytes are refused. URI syntax
+does not establish availability or truth; registrars should publish immutable content and clients
+should check its text hash. IMDCourt encloses the URI in double quotes and labels it **untrusted data,
+not instructions**; JSON escaping is performed by the canonical question library.
 
-## Flows
+An arm first approves and bonds the token. `serve` requires at least `minBond`; an empty or underbonded
+address cannot add a server entry. Each arm has one permanent index per form. Stopping and re-serving
+never remove, reorder or duplicate that index. `minFeeOf` retains the last advertised fee after a stop;
+`stoppedAt` indicates the stop instead of erasing that fee.
 
-1. `registerForm(formId, keyCount, uri)` — anyone, once. `serve(formId, minFee)` / `stopServing(formId)`.
-2. `bond(amount)`, `setSigner(signer)`, `requestExit()`, `withdraw()`, `reactivate()`.
-3. `post(formId, chainId, target, atBlock, feePerArm)` escrows 3 × fee → `draw(jobId)` (≥ 2 blocks later; repeat until filled; `cancel` after `fillDeadline`) → `commit(jobId, keccak256(abi.encode(jobId, arm, values, salt)))` → `reveal(jobId, values, salt, evidenceURI)` → `settle(jobId)`. `timeout(jobId)` strikes and replaces arms that missed a deadline.
-4. Disputes: `settle` opens TIE_OPEN → `draw` → tie break arm `commit`/`reveal` (one value per disputed key, key order) → `settle`.
-5. `challenge(jobId, key, claimedValue, maxCourtFee)` inside the window → `resolve(jobId, key, claimedValue)` once ruled or after `courtDeadline` → `release(jobId)` after the window unlocks tranches.
-6. Reads: `verdict(jobId)`, `latest(chainId, target, formId)`, `jobs`, `armsOf`, `results`, `entries`, `challenges`, `arms`, `isActive`, `unlockedBond`.
+A job stores the form-list length (`serverCount`) and chain-local posting block (`postedBlock`). Bond,
+withdrawal, serve/fee update, reactivation, strike and slash update `lastStateChange`. It must be
+**strictly earlier** than the posting block for a draw, including replacements and the initial tie
+breaker. Same-block enrollment is excluded. New entries cannot join an older job. As explicitly required,
+exit and stop record the last posted job id instead: they exclude jobs posted later (including
+within the same block), but
+cannot opt out of an older job after its seed is visible. An already selected arm retains its duties
+and locked tranche regardless of these later changes. Signer rotation does not change eligibility.
 
-## Review findings and changes
+The draw seed uses the block after posting/reopening and the job id. At the first draw it is saved.
+Each attempt selects `keccak256(abi.encode(seed, attempt)) % serverCount`; the counter advances even
+when that index is ineligible. Calls take at most **32 attempts** and retain the same seed/counter
+between calls. There is no scan over the full form list, candidate compaction or modulo-zero path.
+A poster, a previously drawn arm, or an arm without a currently available tranche is never selected.
+Other jobs' locks still affect available capacity. No draw is allowed after the fill deadline.
 
-An independent adversarial review is IMD's separate step before deployment. The findings below are from
-the implementation's own review pass; each was fixed and tested in this commit.
+`requestExit` stops eligibility for later jobs and opens withdrawal after `exitDelay`. Only unlocked
+bond is withdrawable; bonding again cancels exit. Three strikes deactivate an arm; it can reactivate
+after one day. The core does not enforce one human/operator per arm.
 
-| # | Finding | Change |
-| --- | --- | --- |
-| 1 | `timeout` after everyone revealed (but before `settle`) sent the job back to OPEN with a full roster; `draw` then re-entered COMMIT with nothing to commit, a loop that never settles. | `timeout` reverts `NotPending` when it removes nobody. Test `test_timeout_afterEveryoneRevealedIsNotATimeout`. |
-| 2 | Court pulling the fee from an arbitrary `payer` (as the brief reads) is a theft vector and a Slither `arbitrary-send-erc20` failure. | Fee pulled from `msg.sender`; Arms pulls from the challenger and approves the court. |
-| 3 | A stranger could open a case under an id Arms would later use and block the challenge. | Cases namespaced by asker in both courts. |
-| 4 | The tie break arm's unset answers read as `bytes32(0)`, which could match a legitimate `0` answer when slashing or splitting a stake on a non-disputed key. | `_gave` only counts the tie break arm on keys in `disputedMask`. |
-| 5 | Spot check plus tie break could pay more than the escrow. | Tie break payment capped at the remaining escrow; fuzz test asserts the whole escrow and no more leaves. |
-| 6 | `trancheMultiple` below 3 would let a first slash fall short of the refund. | Constructor requires `trancheMultiple ≥ 3`. |
-| 7 | Arms' runtime was 26.6 KB, over EIP-170. | Arms array moved out of `Job`, memory-struct getters replaced by public mappings, SafeERC20 replaced by checked plain calls, parameters emitted in `Deployed` instead of 22 getters. |
-| 8 | Tests read `block.number`/`block.timestamp` after `vm.roll`/`vm.warp`; via-IR caches them inside one call, so the second roll was a no-op. | Tests use `vm.getBlockNumber()` / `vm.getBlockTimestamp()`. |
-| 9 | Posting is almost free to grief: a job that is drawn and then cancelled locks two tranches for a day at the cost of gas. | Known limitation of v1, documented; a post fee would need a treasury the brief forbids. |
-| 10 | `_candidates` iterates every server of a form. | Known limitation of v1 (gas grows with the number of servers); documented. |
+## Answers, settlement and no-shows
 
-## Tests
+`post(formId, targetChainId, target, atBlock, feePerArm)` pulls `3 * feePerArm`. The target and block
+must be nonzero and the block must fit the oracle's exact JSON integer range. The poster is responsible
+for choosing an already confirmed block on the target chain; Arms cannot validate another chain's head.
+Anyone may `draw`, `timeout`, `cancel`, `settle`, `resolve` or `release`.
 
-```
+- `commit(jobId, arm, hash)` and `reveal(jobId, arm, values, salt, evidenceURI)` require the caller to be
+  that named arm or its current signer. The commitment is `keccak256(abi.encode(jobId, arm, values, salt))`.
+  One signer may serve several arms, including being an arm itself. No reverse signer lookup exists.
+  Delegation authorizes no bonding, exit, withdrawal or payment redirection. Revocation affects only
+  the arm changing its own signer; money always goes to arm addresses.
+- All main arms commit before any main reveal. Reveals at the deadline are timely; timeouts require
+  a strictly later timestamp. Evidence is limited to 200 bytes. A timeout never strikes an entry
+  that completed its required action in time.
+- All matching non-UNKNOWN answers are AGREED; two matching votes give MAJORITY. UNKNOWN is an
+  abstention; NOT_APPLICABLE is an ordinary value. With two arms, distinct non-UNKNOWN answers open
+  one tie breaker for disputed keys only. With three initial arms, there is **never a fourth arm**:
+  each key settles by agreement/majority or becomes UNRESOLVED.
+- Normal payments are proportional to correct final keys, rounded down, with `burnBps` burned. The
+  tie breaker's denominator is the number of disputed keys. Each of at most three arms can earn at
+  most one fee, so the escrow always suffices without capping an earned tie payment. Unused escrow
+  returns to the poster. If the initial tie breaker cannot be drawn by the fill deadline, disputed
+  keys become UNRESOLVED and any agreed keys still settle normally.
+- A commit no-show before any reveal is struck, unlocked and replaced. A reveal round in which nobody
+  reveals also replaces the nonresponders without reducing bonds. A replaced arm cannot be drawn
+  again for that job. Commitments from timely committers survive a commit-timeout replacement.
+- **Once any answer has been revealed, a no-show is never replaced.** All keys become UNRESOLVED,
+  the poster gets the **entire escrow**, and each timely revealer receives **one full fee without a
+  burn**, including a timely UNKNOWN answer. Compensation comes only from the missing arms' locked
+  tranches. When multiple arms miss, they share this debit equally, with integer dust assigned to
+  the first missing arm in the job roster. At most two fees are taken in total, below one tranche.
+  Each missing arm receives a strike; timely revealers do not. Every tranche is unlocked, the job is
+  SETTLED and already released, and no key is challengeable. Escrow `spent` stays zero; the separate
+  `NoShowCompensation` event records each bond debit. This is the only bond reduction besides a ruled
+  challenge (apart from an arm withdrawing its own unlocked bond).
+- The same closure applies when an assigned tie breaker misses commit or reveal, because the main
+  answers are already public. A timely tie revealer is settled normally and cannot be struck by
+  `timeout` while waiting for `settle`.
+- `cancel` only applies to an OPEN, unfilled job after the fill deadline. Such a phase cannot contain
+  revealed answers. It unlocks any selected tranches and refunds the entire escrow. Revealed work
+  cannot be discarded through cancellation.
+
+Normal settlement retains tranches until the challenge window closes and every challenge is resolved.
+`release` then unlocks remaining tranches and burns any unearned challenger reward.
+
+## Court rulings and v1 trust assumptions
+
+Challenges are allowed only for AGREED/MAJORITY keys, inside the window, for a different non-UNKNOWN
+value. One stake is `2 * feePerArm`, plus the live oracle price in the court's asset. Both are pulled
+from the challenger; the court pulls its fee from Arms, never an arbitrary `payer`. Cases are
+namespaced by asker to prevent an outsider occupying another core's case id.
+
+IMDCourt asks for a panel of 5, quorum 4, with a one-day attestation validity. It pins the canonical
+question hash and verifies the protocol's full 15-field EIP-712 attestation in its own domain, the
+sender, the pending request, panel minimums, freshness and replay protection. The callback only stores
+a ruling within its 200,000 gas allowance; `resolve` performs transfers separately.
+
+CLAIMED corrects a key; NEITHER overturns it. Arms that gave the stored wrong value each lose at most
+one locked tranche per job. The first slash refunds the job's actual escrow expenditure, sets aside
+the configured reward fraction of the remainder, and burns the rest. The first CLAIMED ruling earns
+the reward; later slashes burn their proceeds. STORED splits the challenge stake among the arms that
+gave the stored value, unless the job has already been overturned, when the stake returns. A pending
+reward from NEITHER remains available for a later CLAIMED ruling inside the window.
+
+**Accepted for v1: a challenge with no ruling returns the full stake after `courtDeadline`.** The
+stored verdict is unchanged and the Intake fee remains spent. Failure callbacks are unsigned and do
+not pay anyone. This permits challenges to prolong tranche locks for their bounded court deadline
+without losing a stake when the oracle fails. This economic choice has not been redesigned.
+
+Other retained assumptions and operational responsibilities:
+
+- The token is a conventional, exact-transfer, non-rebasing, bool-returning burnable ERC-20 with no
+  transfer callbacks. Fee-on-transfer, hook-bearing and malicious tokens are unsupported. MockToken's
+  owner may mint test tokens freely; that trust is outside Arms. The court and fee token must match
+  their documented interfaces. Core token calls remain transfer, transferFrom, balanceOf and burn;
+  exact court-fee approval is the separate fee-asset path.
+- Block-hash randomness is **not VRF randomness**. A proposer/sequencer can bias it; if the initial
+  seed hash expires before anyone draws, the existing v1 fallback uses the newest previous block.
+  Later calls cannot change a captured seed. Fixed indices remove list reshaping, but cannot remove
+  proposer bias, sybil ownership or competition from other jobs for unlocked capacity.
+- Registering forms and holding a lifetime server index do not prove identity. Stale server entries
+  can make filling sparse pools expensive across many bounded calls. Keepers must progress jobs or
+  cancel/settle at deadlines. Posting and then timing out can temporarily lock capacity for gas cost.
+- The oracle's intake, asset, action and signer are fixed. Price changes are read live, subject to the
+  challenger's maximum fee; signer/action migrations require a new court and core. The absence of an
+  administrator is deliberate. No-result oracle requests consume their price permanently.
+- Forms and evidence must remain publicly available. URI character validation and quoting protect the
+  question boundary; they do not make a remote document trusted or immutable.
+- Operational calls need transactions and gas; there is no paid keeper or protocol treasury. No live
+  oracle smoke request was sent by this job. A later operator must check a real form question before
+  paying and record the eventual ask/request/callback identifiers separately.
+
+## Verification and remaining review
+
+Run from the repository root, without network access:
+
+```sh
 forge build
-FOUNDRY_FUZZ_SEED=0xfdf36b168f85a86bc774f0ff48b0b1f782b198779e504981632cb5dc0716825f forge test
+FOUNDRY_FUZZ_SEED=0x1fd5805ab4bc5ebc9cdd4e5402d6a47d35f8aa16846bca0ff8665ea8f2ed1061 forge test
+forge test
 forge fmt --check
+python3 script/check_launch.py
 ```
 
-49 tests: unit tests for every path and timeout (`test/Arms.t.sol`), the full job and full challenge with
-the mock court, fuzz tests, a handler-based invariant suite (`test/ArmsInvariant.t.sol`: balance equals
-bonds + escrow + stakes + rewards; unlocked bond withdrawable after `exitDelay`; no owner/admin/pause/upgrade
-entry point; UNKNOWN never paid or slashed; poster never above escrow plus one refund; no arm drawn twice and
-the poster never; at most one tranche lost per job and no ruling applied twice; the first slash covers the
-refund; an operator controlling every actor never gains), the court through a mock Intake
-(`test/IMDCourt.t.sol`: exact body bytes, fee pulled and nothing left approved, callback refusals, 200,000
-gas stipend, failure path, end-to-end challenge), the protocol's conformance vector
-(`test/OracleConformance.t.sol`), and the deploy function. Tests read no environment and run in any order.
+The explicit-seed run covers the rejection seed; the plain run uses the existing pinned seed.
+`check_launch.py` checks every deployable constructor (including the mocks), missing library links,
+EIP-170 runtime size and EIP-3860 initcode size **including constructor words**. The full suite includes
+fund conservation and adversarial action sequences, challenge economics, exact oracle body bytes and
+callback failures, protocol digest vectors, all reported regression scenarios and immediate usability
+of the constructor-created modules. Tests do not read or write environment variables and use no RPC.
 
-## After launch
+Both full-suite runs passed 71 reported tests, including the invariant suite. Arms runtime is
+24,232 bytes (344 bytes below EIP-170); its initcode including constructor arguments is 35,599 bytes.
+The updated question wording returned no blockers from the free request checker, with the fixture
+answerability and panel-evidence suggestions recorded in [AUDIT.md](AUDIT.md).
 
-1. **Mint and distribute ARMT.** The owner calls `MockToken.mint`; arms `approve` Arms and `bond(≥ 20 ARMT)`, then `serve(formId, minFee)`.
-2. **Register a form.** `registerForm(keccak256(formText), keyCount, uri)` with the text published at `uri` (ASCII, ≤ 200 bytes).
-3. **One real oracle question on Sepolia.** The owner's wallet needs 0.5 imdTEST (ask the IMD team). Run
-   `forge script script/AskSepolia.s.sol --sig "ask(address,bytes32,address,uint256)" <IMDCourt> <formId> <target> <atBlock> --rpc-url <sepolia> --broadcast --account <wallet>`,
-   wait for `api.imd.fun/oracle/requests/<id>` to show `attested`, then read with
-   `--sig "read(address,address,bytes32)" <IMDCourt> <wallet> <caseId>`. Record the `ask` transaction hash, the request id and the callback transaction hash in the table above.
-4. **Operate.** Anyone may call `draw`, `timeout`, `cancel`, `settle`, `resolve` and `release`; a small keeper that does so keeps jobs moving. Nothing else needs an operator.
+See [AUDIT.md](AUDIT.md) for the regression mapping, checks and remaining limitations. The original
+auditors' scratch proofs were absent from this checkout, so their scenarios were reconstructed from
+the task and rejection report. **An independent audit-judge result remains open:** no such tool was
+exposed and invoking `audit-judge` returned `command not found` (exit 127). Local tests and review are
+not a substitute for that independent step. No claim of audit-judge approval is made.

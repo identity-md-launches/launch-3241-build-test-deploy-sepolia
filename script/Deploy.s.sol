@@ -46,33 +46,37 @@ contract Deploy is Script {
         p.token = token;
         p.court = court;
         p.trancheMultiple = 10;
-        p.stakeMultiple = 2;
         p.minFeePerArm = c.minFeePerArm;
-        p.minBond = 20 * c.minFeePerArm;
         p.maxBondPerArm = c.maxBondPerArm;
         p.maxTotalBonded = c.maxTotalBonded;
         p.burnBps = 1000;
         p.challengerRewardBps = 3000;
-        p.spotCheckOneIn = 10;
         p.commitWindow = 6 hours;
         p.revealWindow = 2 hours;
-        p.fillDeadline = 1 days;
         p.challengeWindow = 7 days;
         p.courtDeadline = 7 days;
         p.exitDelay = 14 days;
-        p.strikesToDeactivate = 3;
-        p.strikeCooldown = 1 days;
-        p.chainA = 11155111;
-        p.chainB = 4663;
-        p.chainC = 0;
-        p.chainD = 0;
-        p.arbitrumBlocks = false;
     }
 
     function deploy(Config memory c) public returns (MockToken token, IMDCourt court, Arms arms) {
         token = new MockToken(c.tokenOwner);
         court = new IMDCourt(IIntake(c.intake), IERC20(c.imd), c.action, c.oracleSigner);
-        arms = new Arms(armsParams(c, address(token), address(court)));
+        Arms.Params memory p = armsParams(c, address(token), address(court));
+        arms = new Arms(
+            p.token,
+            p.court,
+            p.minFeePerArm,
+            p.maxBondPerArm,
+            p.maxTotalBonded,
+            p.trancheMultiple,
+            p.burnBps,
+            p.challengerRewardBps,
+            p.commitWindow,
+            p.revealWindow,
+            p.challengeWindow,
+            p.courtDeadline,
+            p.exitDelay
+        );
     }
 
     function run() external {

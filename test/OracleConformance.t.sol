@@ -38,8 +38,7 @@ contract OracleConsumerConformanceTest is Test {
         vm.chainId(VECTOR_CHAIN);
         vm.warp(ISSUED_AT);
         token = new MockToken(address(this));
-        intake = new MockIntake(WRITER, makeAddr("treasury"));
-        intake.setPrice(ACTION, address(token), 0.5 ether);
+        intake = new MockIntake(WRITER, makeAddr("treasury"), ACTION, address(token), 0.5 ether);
         deployCodeTo(
             "IMDCourt.sol:IMDCourt", abi.encode(address(intake), address(token), ACTION, SIGNER), VECTOR_CONSUMER
         );
@@ -111,7 +110,7 @@ contract OracleConsumerConformanceTest is Test {
             keccak256("form"),
             "ipfs://form",
             1,
-            1,
+            VECTOR_CHAIN,
             address(0xBEEF),
             150,
             bytes32(0),
@@ -123,7 +122,7 @@ contract OracleConsumerConformanceTest is Test {
         IMDCourt.Case memory c = consumer.caseOf(address(this), keccak256("case"));
         OracleAttestation.Attestation memory a = vector();
         a.requestId = keccak256("another request");
-        a.chainId = 1;
+        a.chainId = VECTOR_CHAIN;
         a.questionHash = c.questionHash;
         a.answerType = OracleAttestation.ANSWER_UINT256;
         a.answer = abi.encode(uint256(1));

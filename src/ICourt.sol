@@ -23,6 +23,9 @@ interface ICourt {
     /// @notice The fee the court will pull from `msg.sender` on the next `ask`.
     function fee() external view returns (uint256);
 
+    /// @notice Whether this court accepts questions about the target chain.
+    function supportsChain(uint256 chainId) external view returns (bool);
+
     /// @notice Opens a case. Reverts if the fee is above `maxFee` or the case exists for this asker.
     function ask(
         bytes32 caseId,

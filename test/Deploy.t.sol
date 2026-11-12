@@ -6,6 +6,7 @@ import {Deploy} from "../script/Deploy.s.sol";
 import {Arms} from "../src/Arms.sol";
 import {IMDCourt} from "../src/IMDCourt.sol";
 import {MockToken} from "../src/mocks/MockToken.sol";
+import {ArmsForms} from "../src/ArmsForms.sol";
 
 contract DeployTest is Test {
     function test_deploySepoliaConfig() public {
@@ -30,19 +31,13 @@ contract DeployTest is Test {
             if (logs[i].emitter == address(arms) && logs[i].topics[0] == keccak256(bytes(_deployedSig()))) {
                 Arms.Params memory p = abi.decode(logs[i].data, (Arms.Params));
                 assertEq(p.trancheMultiple, 10);
-                assertEq(p.stakeMultiple, 2);
-                assertEq(p.minBond, 20 ether);
                 assertEq(p.burnBps, 1000);
                 assertEq(p.challengerRewardBps, 3000);
-                assertEq(p.spotCheckOneIn, 10);
                 assertEq(p.commitWindow, 6 hours);
                 assertEq(p.revealWindow, 2 hours);
-                assertEq(p.fillDeadline, 1 days);
                 assertEq(p.challengeWindow, 7 days);
                 assertEq(p.courtDeadline, 7 days);
                 assertEq(p.exitDelay, 14 days);
-                assertEq(p.strikesToDeactivate, 3);
-                assertEq(p.strikeCooldown, 1 days);
                 found = true;
             }
         }
@@ -50,9 +45,26 @@ contract DeployTest is Test {
         // Constructors touch no other contract: the same deployment works on an empty chain too.
         assertGt(address(arms).code.length, 0);
         assertLe(address(arms).code.length, 24_576, "EIP-170");
+        assertLe(address(arms.formRegistry()).code.length, 24_576);
+        assertLe(address(arms.resultCalculator()).code.length, 24_576);
+        assertLe(address(court).code.length, 24_576);
+        assertLe(address(token).code.length, 24_576);
+        assertEq(arms.formRegistry().core(), address(arms));
+        // Registration is usable immediately: there is no initializer, wiring or ownership transfer.
+        bytes32 form = arms.registerForm(keccak256("launch form"), 1, "ipfs://launch-form");
+        (uint8 keys, uint256 servers) = arms.formRegistry().info(form);
+        assertEq(keys, 1);
+        assertEq(servers, 0);
+        ArmsForms registry = arms.formRegistry();
+        vm.expectRevert(ArmsForms.OnlyArms.selector);
+        registry.serve(form, address(this), 1 ether);
+        vm.expectRevert(ArmsForms.OnlyArms.selector);
+        registry.stop(form, address(this), 1, 0);
+        vm.expectRevert(ArmsForms.OnlyArms.selector);
+        registry.register(keccak256("bypass"), 1, "ipfs://bypass");
     }
 
     function _deployedSig() internal pure returns (string memory) {
-        return "Deployed((address,address,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,bool))";
+        return "Deployed((address,address,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256))";
     }
 }

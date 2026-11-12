@@ -51,6 +51,10 @@ contract MockCourt is ICourt {
         return price;
     }
 
+    function supportsChain(uint256 chainId) external pure returns (bool) {
+        return chainId == 11155111 || chainId == 4663;
+    }
+
     function ask(
         bytes32 caseId,
         bytes32 formId,

@@ -14,6 +14,13 @@ interface IArbSys {
 library Blocks {
     IArbSys internal constant ARB_SYS = IArbSys(address(100));
 
+    /// @dev Derive the mode from the deployment chain, never a manifest flag or a code probe.
+    /// Precompiles need not have bytecode. These are the supported Arbitrum/Orbit deployments.
+    function isArbitrum() internal view returns (bool) {
+        return block.chainid == 42161 || block.chainid == 42170 || block.chainid == 421614 || block.chainid == 4663
+            || block.chainid == 46630;
+    }
+
     function number(bool arbitrum) internal view returns (uint256) {
         return arbitrum ? ARB_SYS.arbBlockNumber() : block.number;
     }

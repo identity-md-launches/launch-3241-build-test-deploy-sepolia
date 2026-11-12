@@ -34,9 +34,10 @@ contract MockIntake is IIntake {
     bytes32 public lastRequestId;
     uint256 internal nonce;
 
-    constructor(address writer_, address treasury_) {
+    constructor(address writer_, address treasury_, bytes32 action_, address asset_, uint256 price_) {
         writer = writer_;
         treasury = treasury_;
+        prices[action_][asset_] = price_;
     }
 
     function setPrice(bytes32 action, address asset, uint256 price) external {

@@ -4,13 +4,15 @@ pragma solidity 0.8.26;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ICourt} from "./ICourt.sol";
 import {Blocks} from "./Blocks.sol";
+import {ArmsForms} from "./ArmsForms.sol";
+import {ArmsResults} from "./ArmsResults.sol";
 
 interface IBurnableToken is IERC20 {
     function burn(uint256 amount) external;
 }
 
 /// @title Arms v1: bonded agents answer a fixed form about a target contract
-/// @notice No owner, admin, upgrade or pause. Every number is an immutable constructor argument. The
+/// @notice No owner, admin, upgrade or pause. Parameters are immutable or fixed v1 constants. The
 /// token is used through `transfer`, `transferFrom`, `balanceOf` and `burn(uint256)` only. Anyone can
 /// advance any timeout.
 ///
@@ -43,32 +45,21 @@ contract Arms {
         CANCELLED
     }
 
-    /// @dev One struct so the launch manifest writes it field by field; all static words.
+    /// @dev Used only for the deployment event and off-chain reads; never a constructor argument.
     struct Params {
         address token;
         address court;
-        uint256 trancheMultiple;
-        uint256 stakeMultiple;
-        uint256 minBond;
         uint256 minFeePerArm;
         uint256 maxBondPerArm;
         uint256 maxTotalBonded;
+        uint256 trancheMultiple;
         uint256 burnBps;
         uint256 challengerRewardBps;
-        uint256 spotCheckOneIn;
         uint256 commitWindow;
         uint256 revealWindow;
-        uint256 fillDeadline;
         uint256 challengeWindow;
         uint256 courtDeadline;
         uint256 exitDelay;
-        uint256 strikesToDeactivate;
-        uint256 strikeCooldown;
-        uint256 chainA;
-        uint256 chainB;
-        uint256 chainC;
-        uint256 chainD;
-        bool arbitrumBlocks;
     }
 
     struct ArmInfo {
@@ -80,12 +71,6 @@ contract Arms {
         bool inactive;
         uint64 deactivatedAt;
         uint32 strikes;
-    }
-
-    struct Form {
-        uint8 keyCount;
-        string uri;
-        address[] servers;
     }
 
     struct Job {
@@ -103,6 +88,9 @@ contract Arms {
         uint64 challengeEnd;
         uint256 seedBlock;
         uint256 drawNonce;
+        uint256 drawSeed;
+        uint256 postedBlock;
+        uint256 serverCount;
         uint256 escrow;
         uint256 spent;
         bool overturned;
@@ -165,7 +153,7 @@ contract Arms {
     error ExitDelay();
     error NotInactive();
     error Cooldown();
-    error SignerTaken();
+    error InsufficientBond();
     error FormExists();
     error BadForm();
     error UnknownForm();
@@ -175,7 +163,6 @@ contract Arms {
     error WrongPhase();
     error TooEarly();
     error TooLate();
-    error NoCandidates();
     error NotOnJob();
     error AlreadyCommitted();
     error NotCommitted();
@@ -221,6 +208,7 @@ contract Arms {
     event Slashed(uint256 indexed jobId, address indexed arm, uint256 amount);
     event RewardPaid(uint256 indexed jobId, address indexed challenger, uint256 amount);
     event Released(uint256 indexed jobId);
+    event NoShowCompensation(uint256 indexed jobId, address indexed arm, uint256 amount);
     /// @dev Emitted once at deploy, so every immutable parameter is readable from the logs.
     event Deployed(Params params);
 
@@ -228,7 +216,6 @@ contract Arms {
 
     bytes32 public constant UNKNOWN = keccak256("ARMS_UNKNOWN");
     bytes32 public constant NOT_APPLICABLE = keccak256("ARMS_NOT_APPLICABLE");
-    uint256 internal constant MAX_KEYS = 32;
     uint256 internal constant MAX_URI_BYTES = 200;
     uint256 internal constant BPS = 10_000;
     /// @dev `Number.MAX_SAFE_INTEGER`: the largest block number the court's question can carry.
@@ -237,40 +224,41 @@ contract Arms {
     IBurnableToken public immutable token;
     ICourt public immutable court;
     uint256 internal immutable trancheMultiple;
-    uint256 internal immutable stakeMultiple;
-    uint256 internal immutable minBond;
+    uint256 public constant stakeMultiple = 2;
+    uint256 public immutable minBond;
     uint256 internal immutable minFeePerArm;
     uint256 internal immutable maxBondPerArm;
     uint256 internal immutable maxTotalBonded;
     uint256 internal immutable burnBps;
     uint256 internal immutable challengerRewardBps;
-    uint256 internal immutable spotCheckOneIn;
+    uint256 public constant spotCheckOneIn = 10;
     uint256 internal immutable commitWindow;
     uint256 internal immutable revealWindow;
-    uint256 internal immutable fillDeadline;
+    uint256 public constant fillDeadline = 1 days;
     uint256 internal immutable challengeWindow;
     uint256 internal immutable courtDeadline;
     uint256 internal immutable exitDelay;
-    uint256 internal immutable strikesToDeactivate;
-    uint256 internal immutable strikeCooldown;
-    uint256 internal immutable chainA;
-    uint256 internal immutable chainB;
-    uint256 internal immutable chainC;
-    uint256 internal immutable chainD;
+    uint256 public constant strikesToDeactivate = 3;
+    uint256 public constant strikeCooldown = 1 days;
     bool internal immutable arbitrumBlocks;
+
+    uint256 public constant MAX_DRAW_TRIES = 32;
 
     // ---- storage ----
 
     mapping(address => ArmInfo) public arms;
-    mapping(address => address) public armOfSigner;
+    // Positive eligibility changes invalidate older snapshots. Exit and stop are prospective:
+    // their job cutoffs are checked separately so they cannot opt out of an existing job,
+    // even when the job and exit/stop share a block.
+    mapping(address => uint256) public lastStateChange;
+    mapping(address => uint256) public exitAfterJob;
     uint256 public totalBonded;
     uint256 public totalEscrow;
     uint256 public totalStakes;
     uint256 public totalRewards;
 
-    mapping(bytes32 => Form) public forms;
-    mapping(bytes32 => mapping(address => uint256)) internal serveIndex; // 1-based
-    mapping(bytes32 => mapping(address => uint256)) public minFeeOf;
+    ArmsForms public immutable formRegistry;
+    ArmsResults public immutable resultCalculator;
 
     uint256 public jobCount;
     mapping(uint256 => Job) public jobs;
@@ -283,39 +271,64 @@ contract Arms {
     mapping(bytes32 => Challenge) public challenges;
     mapping(uint256 => mapping(address => mapping(bytes32 => uint256))) public latestJob;
 
-    constructor(Params memory p) {
+    constructor(
+        address token_,
+        address court_,
+        uint256 minFeePerArm_,
+        uint256 maxBondPerArm_,
+        uint256 maxTotalBonded_,
+        uint256 trancheMultiple_,
+        uint256 burnBps_,
+        uint256 challengerRewardBps_,
+        uint256 commitWindow_,
+        uint256 revealWindow_,
+        uint256 challengeWindow_,
+        uint256 courtDeadline_,
+        uint256 exitDelay_
+    ) {
+        uint256 minimum = 2 * trancheMultiple_ * minFeePerArm_;
         if (
-            p.token == address(0) || p.court == address(0) || p.trancheMultiple < 3 || p.stakeMultiple == 0
-                || p.minFeePerArm == 0 || p.minBond == 0 || p.maxBondPerArm < p.minBond
-                || p.maxTotalBonded < p.maxBondPerArm || p.burnBps > BPS || p.challengerRewardBps > BPS
-                || p.spotCheckOneIn == 0 || p.commitWindow == 0 || p.revealWindow == 0 || p.fillDeadline == 0
-                || p.challengeWindow == 0 || p.courtDeadline == 0 || p.strikesToDeactivate == 0 || p.chainA == 0
+            token_ == address(0) || court_ == address(0) || trancheMultiple_ < 3 || minFeePerArm_ == 0
+                || maxBondPerArm_ < minimum || maxTotalBonded_ < maxBondPerArm_ || burnBps_ > BPS
+                || challengerRewardBps_ > BPS || commitWindow_ == 0 || revealWindow_ == 0 || challengeWindow_ == 0
+                || courtDeadline_ == 0 || commitWindow_ > type(uint64).max - block.timestamp
+                || revealWindow_ > type(uint64).max - block.timestamp
+                || challengeWindow_ > type(uint64).max - block.timestamp
+                || courtDeadline_ > type(uint64).max - block.timestamp
+                || exitDelay_ > type(uint64).max - block.timestamp
         ) revert BadParams();
-        token = IBurnableToken(p.token);
-        court = ICourt(p.court);
-        trancheMultiple = p.trancheMultiple;
-        stakeMultiple = p.stakeMultiple;
-        minBond = p.minBond;
-        minFeePerArm = p.minFeePerArm;
-        maxBondPerArm = p.maxBondPerArm;
-        maxTotalBonded = p.maxTotalBonded;
-        burnBps = p.burnBps;
-        challengerRewardBps = p.challengerRewardBps;
-        spotCheckOneIn = p.spotCheckOneIn;
-        commitWindow = p.commitWindow;
-        revealWindow = p.revealWindow;
-        fillDeadline = p.fillDeadline;
-        challengeWindow = p.challengeWindow;
-        courtDeadline = p.courtDeadline;
-        exitDelay = p.exitDelay;
-        strikesToDeactivate = p.strikesToDeactivate;
-        strikeCooldown = p.strikeCooldown;
-        chainA = p.chainA;
-        chainB = p.chainB;
-        chainC = p.chainC;
-        chainD = p.chainD;
-        arbitrumBlocks = p.arbitrumBlocks;
-        emit Deployed(p);
+        token = IBurnableToken(token_);
+        court = ICourt(court_);
+        minFeePerArm = minFeePerArm_;
+        minBond = minimum;
+        maxBondPerArm = maxBondPerArm_;
+        maxTotalBonded = maxTotalBonded_;
+        trancheMultiple = trancheMultiple_;
+        burnBps = burnBps_;
+        challengerRewardBps = challengerRewardBps_;
+        commitWindow = commitWindow_;
+        revealWindow = revealWindow_;
+        challengeWindow = challengeWindow_;
+        courtDeadline = courtDeadline_;
+        exitDelay = exitDelay_;
+        arbitrumBlocks = Blocks.isArbitrum();
+        formRegistry = new ArmsForms(address(this), minFeePerArm_);
+        resultCalculator = new ArmsResults();
+        emit Deployed(Params(
+                token_,
+                court_,
+                minFeePerArm_,
+                maxBondPerArm_,
+                maxTotalBonded_,
+                trancheMultiple_,
+                burnBps_,
+                challengerRewardBps_,
+                commitWindow_,
+                revealWindow_,
+                challengeWindow_,
+                courtDeadline_,
+                exitDelay_
+            ));
     }
 
     // =====================================================================
@@ -327,6 +340,7 @@ contract Arms {
         ArmInfo storage a = arms[msg.sender];
         if (a.bond + amount > maxBondPerArm || totalBonded + amount > maxTotalBonded) revert BondCap();
         a.bond += amount;
+        lastStateChange[msg.sender] = Blocks.number(arbitrumBlocks);
         totalBonded += amount;
         if (a.exiting) {
             a.exiting = false;
@@ -336,11 +350,12 @@ contract Arms {
         emit Bonded(msg.sender, amount, a.bond);
     }
 
-    /// @notice Stops new draws at once; `withdraw` opens after `exitDelay`. Bonding again cancels it.
+    /// @notice Stops draws for jobs posted later; `withdraw` opens after `exitDelay`. Bonding again cancels it.
     function requestExit() external {
         ArmInfo storage a = arms[msg.sender];
         if (a.exiting) revert AlreadyExiting();
         a.exiting = true;
+        exitAfterJob[msg.sender] = jobCount;
         a.exitAt = uint64(block.timestamp + exitDelay);
         emit ExitRequested(msg.sender, a.exitAt);
     }
@@ -353,6 +368,7 @@ contract Arms {
         uint256 amount = a.bond - a.locked;
         if (amount == 0) revert ZeroAmount();
         a.bond -= amount;
+        lastStateChange[msg.sender] = Blocks.number(arbitrumBlocks);
         totalBonded -= amount;
         _send(msg.sender, amount);
         emit Withdrawn(msg.sender, amount);
@@ -361,11 +377,6 @@ contract Arms {
     /// @notice Names a signer that may only `commit` and `reveal` for this arm. Zero clears it.
     function setSigner(address signer) external {
         ArmInfo storage a = arms[msg.sender];
-        if (a.signer != address(0)) delete armOfSigner[a.signer];
-        if (signer != address(0)) {
-            if (armOfSigner[signer] != address(0)) revert SignerTaken();
-            armOfSigner[signer] = msg.sender;
-        }
         a.signer = signer;
         emit SignerSet(msg.sender, signer);
     }
@@ -375,6 +386,7 @@ contract Arms {
         if (!a.inactive) revert NotInactive();
         if (block.timestamp < uint256(a.deactivatedAt) + strikeCooldown) revert Cooldown();
         a.inactive = false;
+        lastStateChange[msg.sender] = Blocks.number(arbitrumBlocks);
         a.strikes = 0;
         emit Reactivated(msg.sender);
     }
@@ -393,43 +405,21 @@ contract Arms {
     // Forms
     // =====================================================================
 
-    function registerForm(bytes32 formId, uint8 keyCount, string calldata uri) external {
-        if (formId == bytes32(0) || keyCount == 0 || keyCount > MAX_KEYS) revert BadForm();
-        bytes memory u = bytes(uri);
-        if (u.length > MAX_URI_BYTES) revert BadForm();
-        for (uint256 i; i < u.length; ++i) {
-            uint8 c = uint8(u[i]);
-            if (c < 0x20 || c > 0x7e || c == 0x22 || c == 0x5c) revert BadForm();
-        }
-        Form storage f = forms[formId];
-        if (f.keyCount != 0) revert FormExists();
-        f.keyCount = keyCount;
-        f.uri = uri;
+    /// @notice The id commits to the text hash, key count and URI together.
+    function registerForm(bytes32 textHash, uint8 keyCount, string calldata uri) external returns (bytes32 formId) {
+        formId = formRegistry.register(textHash, keyCount, uri);
         emit FormRegistered(formId, keyCount, uri);
     }
 
     function serve(bytes32 formId, uint256 minFee) external {
-        Form storage f = forms[formId];
-        if (f.keyCount == 0) revert UnknownForm();
-        if (minFee < minFeePerArm) revert FeeTooLow();
-        if (serveIndex[formId][msg.sender] == 0) {
-            f.servers.push(msg.sender);
-            serveIndex[formId][msg.sender] = f.servers.length;
-        }
-        minFeeOf[formId][msg.sender] = minFee;
+        if (arms[msg.sender].bond < minBond) revert InsufficientBond();
+        formRegistry.serve(formId, msg.sender, minFee);
+        lastStateChange[msg.sender] = Blocks.number(arbitrumBlocks);
         emit Serving(formId, msg.sender, minFee);
     }
 
     function stopServing(bytes32 formId) external {
-        uint256 idx = serveIndex[formId][msg.sender];
-        if (idx == 0) revert UnknownForm();
-        Form storage f = forms[formId];
-        address last = f.servers[f.servers.length - 1];
-        f.servers[idx - 1] = last;
-        serveIndex[formId][last] = idx;
-        f.servers.pop();
-        delete serveIndex[formId][msg.sender];
-        delete minFeeOf[formId][msg.sender];
+        formRegistry.stop(formId, msg.sender, Blocks.number(arbitrumBlocks), jobCount);
         emit StoppedServing(formId, msg.sender);
     }
 
@@ -441,8 +431,8 @@ contract Arms {
         external
         returns (uint256 jobId)
     {
-        Form storage f = forms[formId];
-        if (f.keyCount == 0) revert UnknownForm();
+        (uint8 keyCount, uint256 serverCount) = formRegistry.info(formId);
+        if (keyCount == 0) revert UnknownForm();
         if (feePerArm < minFeePerArm) revert FeeTooLow();
         if (!chainAllowed(targetChainId)) revert ChainNotAllowed();
         if (target == address(0) || atBlock == 0 || atBlock > MAX_BLOCK) revert BadTarget();
@@ -454,54 +444,51 @@ contract Arms {
         j.atBlock = atBlock;
         j.feePerArm = feePerArm;
         j.poster = msg.sender;
-        j.keyCount = f.keyCount;
+        j.keyCount = keyCount;
         j.escrow = 3 * feePerArm;
+        j.postedBlock = Blocks.number(arbitrumBlocks);
+        j.serverCount = serverCount;
         _reopen(j, Phase.OPEN);
         totalEscrow += j.escrow;
         _pull(msg.sender, j.escrow);
         emit Posted(jobId, formId, msg.sender, feePerArm);
     }
 
-    /// @notice Draws arms for an open job (or the tie break arm), seeded by a later block hash and the
-    /// job id. Reverts `NoCandidates` when nobody is eligible; call again later.
+    /// @notice At most MAX_DRAW_TRIES attempts over the posting-time list length, with stable indices.
+    /// Skips ineligible entries without rebuilding the list. Repeated calls continue the same sequence.
     function draw(uint256 jobId) external {
         Job storage j = jobs[jobId];
         if (j.phase != Phase.OPEN && j.phase != Phase.TIE_OPEN) revert WrongPhase();
-        uint256 n = Blocks.number(arbitrumBlocks);
-        if (n <= j.seedBlock) revert TooEarly();
-        bytes32 h = Blocks.hash(j.seedBlock, arbitrumBlocks);
-        if (h == bytes32(0)) {
-            // The hash is gone: the seed block moves forward to the newest one still available.
-            j.seedBlock = n - 1;
-            h = Blocks.hash(n - 1, arbitrumBlocks);
+        if (block.timestamp > uint256(j.openSince) + fillDeadline) revert TooLate();
+        if (j.drawSeed == 0) {
+            uint256 n = Blocks.number(arbitrumBlocks);
+            if (n <= j.seedBlock) revert TooEarly();
+            bytes32 h = Blocks.hash(j.seedBlock, arbitrumBlocks);
+            if (h == bytes32(0)) {
+                j.seedBlock = n - 1;
+                h = Blocks.hash(n - 1, arbitrumBlocks);
+            }
+            j.drawSeed = uint256(keccak256(abi.encode(h, jobId, uint256(0))));
         }
-        uint256 seed = uint256(keccak256(abi.encode(h, jobId, j.drawNonce)));
-        address[] memory cands = _candidates(jobId, j);
-        if (cands.length == 0) revert NoCandidates();
-        if (j.phase == Phase.OPEN) {
-            if (j.needed == 0) j.needed = seed % spotCheckOneIn == 0 ? 3 : 2;
-            uint256 missing = j.needed - jobArms[jobId].length;
-            uint256 left = cands.length;
-            for (uint256 i; i < missing && left > 0; ++i) {
-                uint256 idx = uint256(keccak256(abi.encode(seed, i))) % left;
-                address a = cands[idx];
-                cands[idx] = cands[left - 1];
-                --left;
-                _assign(jobId, j, a, false);
+        bool tie = j.phase == Phase.TIE_OPEN;
+        if (!tie && j.needed == 0) j.needed = j.drawSeed % spotCheckOneIn == 0 ? 3 : 2;
+        if (j.serverCount == 0) return;
+        for (uint256 i; i < MAX_DRAW_TRIES; ++i) {
+            uint256 idx = uint256(keccak256(abi.encode(j.drawSeed, j.drawNonce++))) % j.serverCount;
+            address a = formRegistry.candidate(j.formId, idx, jobId, j.feePerArm);
+            if (!_eligible(jobId, j, a)) continue;
+            _assign(jobId, j, a, tie);
+            if (tie) {
+                j.tieBreaker = a;
+                j.phase = Phase.TIE_COMMIT;
+            } else {
                 jobArms[jobId].push(a);
-            }
-            if (jobArms[jobId].length == j.needed) {
+                if (jobArms[jobId].length != j.needed) continue;
                 j.phase = Phase.COMMIT;
-                j.deadline = uint64(block.timestamp + commitWindow);
             }
-        } else {
-            address a = cands[seed % cands.length];
-            _assign(jobId, j, a, true);
-            j.tieBreaker = a;
-            j.phase = Phase.TIE_COMMIT;
             j.deadline = uint64(block.timestamp + commitWindow);
+            return;
         }
-        ++j.drawNonce;
     }
 
     /// @notice Refunds a job that was not filled (or whose tie break arm was not found) by `fillDeadline`.
@@ -523,9 +510,9 @@ contract Arms {
     }
 
     /// @notice `hash = keccak256(abi.encode(jobId, arm, values, salt))`, by the arm or its signer.
-    function commit(uint256 jobId, bytes32 hash) external {
+    function commit(uint256 jobId, address arm, bytes32 hash) external {
         Job storage j = jobs[jobId];
-        address arm = _actor(jobId, j);
+        _checkActor(jobId, j, arm);
         bool tie = arm == j.tieBreaker;
         if (tie ? j.phase != Phase.TIE_COMMIT : j.phase != Phase.COMMIT) revert WrongPhase();
         if (block.timestamp > j.deadline) revert TooLate();
@@ -544,9 +531,11 @@ contract Arms {
     }
 
     /// @notice One value per key (a tie break arm: one per disputed key, in key order).
-    function reveal(uint256 jobId, bytes32[] calldata values, bytes32 salt, string calldata evidenceURI) external {
+    function reveal(uint256 jobId, address arm, bytes32[] calldata values, bytes32 salt, string calldata evidenceURI)
+        external
+    {
         Job storage j = jobs[jobId];
-        address arm = _actor(jobId, j);
+        _checkActor(jobId, j, arm);
         bool tie = arm == j.tieBreaker;
         if (tie ? j.phase != Phase.TIE_REVEAL : j.phase != Phase.REVEAL) revert WrongPhase();
         if (block.timestamp > j.deadline) revert TooLate();
@@ -572,13 +561,25 @@ contract Arms {
         emit Revealed(jobId, arm);
     }
 
-    /// @notice Strikes and replaces arms that missed the commit or reveal deadline. Anyone may call.
+    /// @notice Replace no-shows only while every answer remains sealed. Once an answer is public,
+    /// close the job and compensate timely revealers from the no-shows' locked tranches.
     function timeout(uint256 jobId) external {
         Job storage j = jobs[jobId];
         if (block.timestamp <= j.deadline) revert TooEarly();
-        uint256 tranche = trancheMultiple * j.feePerArm;
         if (j.phase == Phase.COMMIT || j.phase == Phase.REVEAL) {
             bool needReveal = j.phase == Phase.REVEAL;
+            if (needReveal) {
+                uint256 revealed;
+                for (uint256 k; k < jobArms[jobId].length; ++k) {
+                    if (entries[jobId][jobArms[jobId][k]].revealed) ++revealed;
+                }
+                if (revealed == jobArms[jobId].length) revert NotPending();
+                if (revealed != 0) {
+                    _closeNoShow(jobId, j);
+                    return;
+                }
+            }
+            uint256 tranche = trancheMultiple * j.feePerArm;
             uint256 removed;
             uint256 i;
             while (i < jobArms[jobId].length) {
@@ -595,20 +596,62 @@ contract Arms {
                 ++removed;
                 emit Replaced(jobId, a);
             }
-            // Everyone revealed in time and nobody settled yet: that is `settle`'s job, not a timeout.
             if (removed == 0) revert NotPending();
             _reopen(j, Phase.OPEN);
         } else if (j.phase == Phase.TIE_COMMIT || j.phase == Phase.TIE_REVEAL) {
-            address a = j.tieBreaker;
-            arms[a].locked -= tranche;
-            _strike(a);
-            delete entries[jobId][a];
-            j.tieBreaker = address(0);
-            emit Replaced(jobId, a);
-            _reopen(j, Phase.TIE_OPEN);
+            if (entries[jobId][j.tieBreaker].revealed) revert NotPending();
+            // Main answers are already public, so a missing tie breaker cannot be replaced either.
+            _closeNoShow(jobId, j);
         } else {
             revert WrongPhase();
         }
+    }
+
+    function _closeNoShow(uint256 jobId, Job storage j) internal {
+        uint256 n = jobArms[jobId].length;
+        uint256 voters = n + (j.tieBreaker != address(0) ? 1 : 0);
+        uint256 revealed;
+        for (uint256 i; i < voters; ++i) {
+            address a = i < n ? jobArms[jobId][i] : j.tieBreaker;
+            if (entries[jobId][a].revealed) ++revealed;
+        }
+        uint256 missing = voters - revealed;
+        uint256 compensation = revealed * j.feePerArm;
+        uint256 share = compensation / missing;
+        uint256 dust = compensation % missing;
+        uint256 tranche = trancheMultiple * j.feePerArm;
+        for (uint256 i; i < voters; ++i) {
+            address a = i < n ? jobArms[jobId][i] : j.tieBreaker;
+            arms[a].locked -= tranche;
+            if (!entries[jobId][a].revealed) {
+                uint256 loss = share + dust;
+                dust = 0;
+                arms[a].bond -= loss;
+                totalBonded -= loss;
+                _strike(a);
+                emit NoShowCompensation(jobId, a, loss);
+            }
+        }
+        for (uint8 k; k < j.keyCount; ++k) {
+            results[jobId][k] = KeyResult(bytes32(0), Status.UNRESOLVED);
+        }
+        j.phase = Phase.SETTLED;
+        j.released = true;
+        j.challengeEnd = uint64(block.timestamp);
+        latestJob[j.targetChainId][j.target][j.formId] = jobId;
+        uint256 refund = j.escrow;
+        j.escrow = 0;
+        totalEscrow -= refund;
+        // Compensation is one full fee, without a burn: it is not an adjudicated answer payment.
+        for (uint256 i; i < voters; ++i) {
+            address a = i < n ? jobArms[jobId][i] : j.tieBreaker;
+            if (entries[jobId][a].revealed) {
+                _send(a, j.feePerArm);
+                emit Paid(jobId, a, j.feePerArm, 0);
+            }
+        }
+        _send(j.poster, refund);
+        emit Settled(jobId, 0, refund);
     }
 
     /// @notice Settles a job whose arms have all revealed: pays, burns, returns the rest of the escrow,
@@ -618,16 +661,8 @@ contract Arms {
         Job storage j = jobs[jobId];
         if (j.phase == Phase.REVEAL) {
             if (!_allRevealed(jobId, j)) revert NotPending();
-            uint32 mask;
-            uint8 count;
-            for (uint8 k; k < j.keyCount; ++k) {
-                (,, bool disputed) = _evaluate(jobId, j, k, false);
-                if (disputed) {
-                    mask |= uint32(1) << k;
-                    ++count;
-                }
-            }
-            if (mask != 0) {
+            (uint32 mask, uint8 count) = resultCalculator.disputes(jobId);
+            if (mask != 0 && j.needed == 2) {
                 j.disputedMask = mask;
                 j.disputedCount = count;
                 _reopen(j, Phase.TIE_OPEN);
@@ -716,10 +751,11 @@ contract Arms {
             if (!asset.transferFrom(msg.sender, address(this), courtFee)) revert TokenCallFailed();
             if (!asset.approve(address(court), courtFee)) revert TokenCallFailed();
         }
+        (, string memory formURI) = formRegistry.forms(j.formId);
         court.ask(
             caseId,
             j.formId,
-            forms[j.formId].uri,
+            formURI,
             key,
             j.targetChainId,
             j.target,
@@ -786,27 +822,8 @@ contract Arms {
     // Reads
     // =====================================================================
 
-    function verdict(uint256 jobId) public view returns (Verdict memory v) {
-        Job storage j = jobs[jobId];
-        v.values = new bytes32[](j.keyCount);
-        v.statuses = new Status[](j.keyCount);
-        for (uint8 k; k < j.keyCount; ++k) {
-            KeyResult storage r = results[jobId][k];
-            v.values[k] = r.value;
-            v.statuses[k] = r.status;
-        }
-        v.feePerArm = j.feePerArm;
-        v.overturned = j.overturned;
-        v.challengeEnd = j.challengeEnd;
-        v.atBlock = j.atBlock;
-        v.arms = jobArms[jobId];
-        v.evidence = new string[](jobArms[jobId].length);
-        for (uint256 i; i < jobArms[jobId].length; ++i) {
-            v.evidence[i] = entries[jobId][jobArms[jobId][i]].evidence;
-        }
-        v.tieBreaker = j.tieBreaker;
-        v.tieEvidence = entries[jobId][j.tieBreaker].evidence;
-        v.phase = j.phase;
+    function verdict(uint256 jobId) public view returns (Verdict memory) {
+        return resultCalculator.verdict(jobId);
     }
 
     /// @notice The newest settled job for a target under a form. `jobId` zero means none.
@@ -819,16 +836,12 @@ contract Arms {
         if (jobId != 0) v = verdict(jobId);
     }
 
-    function serversOf(bytes32 formId) external view returns (address[] memory) {
-        return forms[formId].servers;
-    }
-
     function armsOf(uint256 jobId) external view returns (address[] memory) {
         return jobArms[jobId];
     }
 
     function chainAllowed(uint256 chainId) public view returns (bool) {
-        return chainId != 0 && (chainId == chainA || chainId == chainB || chainId == chainC || chainId == chainD);
+        return court.supportsChain(chainId);
     }
 
     // =====================================================================
@@ -848,6 +861,8 @@ contract Arms {
         j.openSince = uint64(block.timestamp);
         j.seedBlock = Blocks.number(arbitrumBlocks) + 1;
         j.deadline = 0;
+        j.drawSeed = 0;
+        j.drawNonce = 0;
     }
 
     function _assign(uint256 jobId, Job storage j, address a, bool tie) internal {
@@ -856,28 +871,17 @@ contract Arms {
         emit Drawn(jobId, a, tie);
     }
 
-    function _candidates(uint256 jobId, Job storage j) internal view returns (address[] memory out) {
-        address[] storage servers = forms[j.formId].servers;
-        uint256 tranche = trancheMultiple * j.feePerArm;
-        out = new address[](servers.length);
-        uint256 n;
-        for (uint256 i; i < servers.length; ++i) {
-            address a = servers[i];
-            if (a == j.poster || wasDrawn[jobId][a]) continue;
-            if (minFeeOf[j.formId][a] > j.feePerArm) continue;
-            if (!isActive(a)) continue;
-            if (arms[a].bond - arms[a].locked < tranche) continue;
-            out[n++] = a;
+    function _eligible(uint256 jobId, Job storage j, address a) internal view returns (bool) {
+        if (a == address(0) || a == j.poster || wasDrawn[jobId][a] || lastStateChange[a] >= j.postedBlock) {
+            return false;
         }
-        assembly ("memory-safe") {
-            mstore(out, n)
-        }
+        ArmInfo storage s = arms[a];
+        if (s.bond < minBond || s.inactive || (s.exiting && exitAfterJob[a] < jobId)) return false;
+        return s.bond - s.locked >= trancheMultiple * j.feePerArm;
     }
 
-    function _actor(uint256 jobId, Job storage j) internal view returns (address arm) {
-        if (_onJob(jobId, j, msg.sender)) return msg.sender;
-        arm = armOfSigner[msg.sender];
-        if (arm == address(0) || !_onJob(jobId, j, arm)) revert NotOnJob();
+    function _checkActor(uint256 jobId, Job storage j, address arm) internal view {
+        if (!_onJob(jobId, j, arm) || (msg.sender != arm && msg.sender != arms[arm].signer)) revert NotOnJob();
     }
 
     function _onJob(uint256 jobId, Job storage j, address a) internal view returns (bool) {
@@ -906,6 +910,7 @@ contract Arms {
     function _strike(address a) internal {
         ArmInfo storage s = arms[a];
         ++s.strikes;
+        lastStateChange[a] = Blocks.number(arbitrumBlocks);
         bool deactivated = !s.inactive && s.strikes >= strikesToDeactivate;
         if (deactivated) {
             s.inactive = true;
@@ -914,75 +919,15 @@ contract Arms {
         emit Struck(a, s.strikes, deactivated);
     }
 
-    /// @dev Tallies the main arms' answers for `key` (and the tie break arm's when `withTie`).
-    function _evaluate(uint256 jobId, Job storage j, uint8 key, bool withTie)
-        internal
-        view
-        returns (bytes32 value, Status status, bool disputed)
-    {
-        bytes32[4] memory vals;
-        uint256[4] memory cnt;
-        uint256 m;
-        uint256 n = jobArms[jobId].length;
-        uint256 answered;
-        uint256 voters = n + (withTie ? 1 : 0);
-        for (uint256 i; i < voters; ++i) {
-            address a = i < n ? jobArms[jobId][i] : j.tieBreaker;
-            bytes32 v = answerOf[jobId][a][key];
-            if (v == UNKNOWN) continue;
-            ++answered;
-            bool found;
-            for (uint256 x; x < m; ++x) {
-                if (vals[x] == v) {
-                    ++cnt[x];
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                vals[m] = v;
-                cnt[m] = 1;
-                ++m;
-            }
-        }
-        if (m == 1 && answered == n && !withTie) return (vals[0], Status.AGREED, false);
-        uint256 best;
-        bool unique = true;
-        for (uint256 x = 1; x < m; ++x) {
-            if (cnt[x] > cnt[best]) {
-                best = x;
-                unique = true;
-            } else if (cnt[x] == cnt[best]) {
-                unique = false;
-            }
-        }
-        if (m > 0 && cnt[best] >= 2 && unique) return (vals[best], Status.MAJORITY, false);
-        if (m >= 2 && !withTie) return (bytes32(0), Status.NONE, true);
-        return (bytes32(0), Status.UNRESOLVED, false);
-    }
-
     function _finalize(uint256 jobId, Job storage j, bool withTie) internal {
-        uint256 n = jobArms[jobId].length;
-        uint256[] memory correct = new uint256[](n);
-        uint256 tieCorrect;
+        ArmsResults.Outcome memory o = resultCalculator.settlement(jobId, withTie);
         for (uint8 k; k < j.keyCount; ++k) {
-            bool disputed = j.disputedMask & (uint32(1) << k) != 0;
-            (bytes32 value, Status status,) = _evaluate(jobId, j, k, withTie && disputed);
-            if (disputed && !withTie) status = Status.UNRESOLVED;
-            results[jobId][k] = KeyResult(value, status);
-            if (status != Status.AGREED && status != Status.MAJORITY) continue;
-            for (uint256 i; i < n; ++i) {
-                if (answerOf[jobId][jobArms[jobId][i]][k] == value) ++correct[i];
-            }
-            if (withTie && disputed && answerOf[jobId][j.tieBreaker][k] == value) ++tieCorrect;
+            results[jobId][k] = KeyResult(o.values[k], o.statuses[k]);
         }
-        for (uint256 i; i < n; ++i) {
-            _pay(jobId, j, jobArms[jobId][i], j.feePerArm * correct[i] / j.keyCount);
+        for (uint256 i; i < jobArms[jobId].length; ++i) {
+            _pay(jobId, j, jobArms[jobId][i], o.payments[i]);
         }
-        if (withTie && j.disputedCount > 0) {
-            uint256 due = j.feePerArm * tieCorrect / j.disputedCount;
-            _pay(jobId, j, j.tieBreaker, due > j.escrow ? j.escrow : due);
-        }
+        if (withTie) _pay(jobId, j, j.tieBreaker, o.tiePayment);
         uint256 back = j.escrow;
         j.escrow = 0;
         totalEscrow -= back;
@@ -1018,6 +963,7 @@ contract Arms {
             if (slashedIn[jobId][a] || !_gave(jobId, j, a, key, stored)) continue;
             slashedIn[jobId][a] = true;
             arms[a].bond -= tranche;
+            lastStateChange[a] = Blocks.number(arbitrumBlocks);
             arms[a].locked -= tranche;
             total += tranche;
             emit Slashed(jobId, a, tranche);
