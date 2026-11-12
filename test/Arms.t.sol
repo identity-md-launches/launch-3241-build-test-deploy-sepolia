@@ -298,11 +298,17 @@ contract ArmsTest is ArmsBase {
         }
     }
 
-    function test_draw_seedBlockMovesForwardWhenHashIsGone() public {
+    function test_draw_expiredSeedIsNeverReplaced() public {
         uint256 id = _post();
+        uint256 seedBlock = _job(id).seedBlock;
         vm.roll(vm.getBlockNumber() + 300);
+        vm.expectRevert(Arms.SeedExpired.selector);
         arms.draw(id);
-        assertEq(uint8(_job(id).phase), uint8(Arms.Phase.COMMIT));
+        Arms.Job memory j = _job(id);
+        assertEq(uint8(j.phase), uint8(Arms.Phase.OPEN));
+        assertEq(j.seedBlock, seedBlock, "the seed block never moves");
+        assertEq(j.drawSeed, 0);
+        assertEq(arms.armsOf(id).length, 0);
     }
 
     function test_cancel_refundsAndUnlocks() public {

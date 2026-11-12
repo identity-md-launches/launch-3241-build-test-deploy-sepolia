@@ -25,6 +25,9 @@ and previous rejection. They live in delivered tests, not in disposable scratch 
 | 11: regressions/full suite/judge | Delivered reconstructed regressions and ran the full suite. Independent judge unavailable; see open item below. | `test/AuditRegressions.t.sol`, existing unit/invariant/conformance suites |
 | 12: manifest compatibility/no setup | No constructor has an array, struct, string or bytes argument or receives ETH. Court, mocks and child contracts fit the entry limit. Both children bind automatically; MockIntake's initial price is constructor-configured. | `test_deploySepoliaConfig`, `script/check_launch.py`, all fixture setups without initialization calls |
 | Previous rejection: wrong Arbitrum seed height | Select block mode from deployment chain id without probing precompile bytecode. Read the chain-local number/hash from ArbSys. | `test_audit12_arbitrumBlockModeComesFromChainId`: L1 stays at 1000 while L2 posting is 10010 and seed block is 10011. |
+| Review e6b8ee93 (high): `draw` re-seeded from `blockhash(n-1)` when the seed block's hash had expired | Reproduced with the reviewer's proof (23 arm sets across 24 blocks). The fallback is removed: one opening has one seed, and `draw` reverts `SeedExpired` when that hash is gone and no seed was saved. `seedBlock` never moves. The job is refunded by `cancel`, or the tie break closed by `settle`, after `fillDeadline`. Chosen over re-arming to a future block, which would let whoever watches an unattended job reroll it every 256 blocks. | The five `test_audit13_*` cases (same arms at seed block +1, +2, +100, +256; refusal for 48 blocks after; refund and repost; expired tie break; expired replacement draw; ArbSys revert and zero answer on chain 4663), `test_draw_expiredSeedIsNeverReplaced`; the reviewer's proof passes unchanged |
+| Review 2c49d583 (low): a no-show close replaced the target's latest verdict | Reproduced. `_closeNoShow` no longer writes `latestJob`; the closed job still settles, refunds and compensates. | `test_audit14_noShowCloseDoesNotReplaceTheLatestVerdict` (main no-show, tie breaker no-show, and a later answered job still becoming latest) |
+| Review a3d6c106 (info): UNKNOWN against a value on a two-arm job is UNRESOLVED | Reproduces as described and is the accepted design (UNKNOWN is an abstention). Not changed; stated in README as accepted for v1. With the two fixes above an arm can neither choose to be drawn nor erase an earlier verdict this way. | Existing `test_audit4_*` and settlement tests |
 
 The protocol's fixed attestation digest and canonical question-hash vectors are unchanged. The
 fresh-signature smoke case now asks about a supported target chain; it previously asked about chain 1,
@@ -34,10 +37,10 @@ which the accepted court target list does not include.
 
 - `forge build --sizes`: passed with pinned Solc 0.8.26.
 - Full `forge test` with `FOUNDRY_FUZZ_SEED=0x1fd5805ab4bc5ebc9cdd4e5402d6a47d35f8aa16846bca0ff8665ea8f2ed1061`:
-  **71 reported tests passed, zero failures/skips**, including all five invariant properties grouped
+  **77 reported tests passed, zero failures/skips**, including all five invariant properties grouped
   by this Foundry runner. Fuzz cases used 256 runs; invariant handler used 64 runs × 40 calls.
 - Plain `forge test`, using the existing pinned seed
-  `0xfdf36b168f85a86bc774f0ff48b0b1f782b198779e504981632cb5dc0716825f`: **71 passed, zero failures/skips**.
+  `0xfdf36b168f85a86bc774f0ff48b0b1f782b198779e504981632cb5dc0716825f`: **77 passed, zero failures/skips**.
 - `forge fmt --check`: passed.
 - `python3 script/check_launch.py`: all seven concrete application/mock artifacts passed constructor
   entry/type/payability, library linkage, EIP-170 and EIP-3860 checks. The latter includes ABI argument words.
@@ -50,7 +53,7 @@ which the accepted court target list does not include.
 
 | Contract | Constructor entries | Runtime bytes | Initcode including arguments |
 | --- | ---: | ---: | ---: |
-| Arms | 13 | 24,232 | 35,599 |
+| Arms | 13 | 24,146 | 35,513 |
 | ArmsForms | 2 | 3,356 | 3,625 |
 | ArmsResults | 0 | 5,743 | 5,769 |
 | IMDCourt | 4 | 12,780 | 14,324 |
@@ -58,7 +61,7 @@ which the accepted court target list does not include.
 | MockToken | 1 | 2,227 | 3,208 |
 | MockIntake | 5 | 3,381 | 3,783 |
 
-Arms has 344 bytes of runtime margin under EIP-170. Re-run size checks after future changes. Its
+Arms has 430 bytes of runtime margin under EIP-170. Re-run size checks after future changes. Its
 initcode includes both child contracts and remains below EIP-3860. Every library call is internal;
 there are no unresolved link placeholders or post-deployment wiring calls.
 
@@ -72,8 +75,10 @@ there are no unresolved link placeholders or post-deployment wiring calls.
 2. **Original proof provenance:** the task's scratch proofs were absent. The supplied scenarios now
    have passing regressions, but they cannot be claimed as byte-for-byte conversions of unavailable
    source proofs. The original proofs should also be rerun if the independent reviewer has them.
-3. **Retained v1 risks, not redesigned:** proposer/sequencer-biased block hashes and the uncaptured
-   seed's expired-hash fallback; multiple addresses controlled by one operator; sparse append-only
+3. **Retained v1 risks, not redesigned:** proposer/sequencer-biased block hashes; a job
+   nobody draws within 256 blocks of its seed block waits for `cancel` (about a minute on an Orbit
+   chain, so posters there need a keeper); a poster can post several jobs and prefer one; UNKNOWN
+   against a value on a two-arm job is UNRESOLVED at no cost to the abstaining arm; multiple addresses controlled by one operator; sparse append-only
    pools and competition for free tranches; temporary capacity griefing by posting; full stake
    returned on a court timeout; reliance on a fixed oracle signer and action; no paid keeper.
 4. **Deployment/operations:** later deployer must verify the retained Sepolia addresses, current

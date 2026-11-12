@@ -570,4 +570,207 @@ contract AuditRegressionsTest is ArmsBase {
         assertGe(arms.armsOf(id).length, 2);
         assertEq(vm.getBlockNumber(), 1000, "L1 height did not advance");
     }
+
+    // ---- Revision after the independent review: the draw seed and the no-show verdict ----
+
+    function _setKey(address[] memory a) internal pure returns (bytes32 k) {
+        // Order independent: the set of arms, not the order they were pushed in.
+        for (uint256 i; i < a.length; ++i) {
+            k ^= keccak256(abi.encode(a[i]));
+        }
+    }
+
+    /// @dev The reviewer's DrawGrind proof on this suite's fixture. While the chain serves the seed
+    /// block's hash the draw is the same whichever block `draw` lands in; once it is gone no block
+    /// gives a draw at all, so the caller cannot pick one by picking the block.
+    function test_audit13_drawDoesNotDependOnTheBlockItIsCalledIn() public {
+        vm.roll(2000);
+        vm.prank(poster);
+        uint256 id = arms.post(formId, CHAIN, target, AT_BLOCK, FEE);
+        uint256 seedBlock = _job(id).seedBlock;
+        assertEq(seedBlock, 2001);
+        uint256[4] memory offsets = [uint256(1), 2, 100, 256];
+        bytes32 seedHash = keccak256("the hash of the block after posting");
+        bytes32 first;
+        for (uint256 i; i < offsets.length; ++i) {
+            uint256 snap = vm.snapshotState();
+            vm.roll(seedBlock + offsets[i]);
+            vm.setBlockhash(seedBlock, seedHash);
+            for (uint256 t; t < 10 && _job(id).phase != Arms.Phase.COMMIT; ++t) {
+                arms.draw(id);
+            }
+            Arms.Job memory j = _job(id);
+            assertEq(uint8(j.phase), uint8(Arms.Phase.COMMIT));
+            assertEq(j.seedBlock, seedBlock);
+            assertEq(j.drawSeed, uint256(keccak256(abi.encode(seedHash, id, uint256(0)))));
+            bytes32 k = _setKey(arms.armsOf(id));
+            if (i == 0) first = k;
+            assertEq(k, first, "same arms whichever block the draw lands in");
+            vm.revertToState(snap);
+        }
+        for (uint256 b = seedBlock + 257; b < seedBlock + 257 + 48; ++b) {
+            vm.roll(b);
+            vm.expectRevert(Arms.SeedExpired.selector);
+            arms.draw(id);
+        }
+        Arms.Job memory after_ = _job(id);
+        assertEq(after_.seedBlock, seedBlock, "no other block is ever substituted");
+        assertEq(after_.drawSeed, 0);
+        assertEq(after_.needed, 0, "the job size is not chosen either");
+        assertEq(arms.armsOf(id).length, 0);
+    }
+
+    function test_audit13_expiredSeedJobIsRefundedByCancelAndAReposterGetsANewSeed() public {
+        uint256 id = _post();
+        vm.roll(_job(id).seedBlock + 257);
+        vm.expectRevert(Arms.SeedExpired.selector);
+        arms.draw(id);
+        vm.expectRevert(Arms.TooEarly.selector);
+        arms.cancel(id);
+        vm.warp(vm.getBlockTimestamp() + 1 days + 1);
+        vm.expectRevert(Arms.TooLate.selector);
+        arms.draw(id);
+        uint256 before = token.balanceOf(poster);
+        arms.cancel(id);
+        assertEq(token.balanceOf(poster) - before, 3 * FEE, "whole escrow back");
+        assertEq(uint8(_job(id).phase), uint8(Arms.Phase.CANCELLED));
+        for (uint256 i; i < armSet.length; ++i) {
+            assertEq(_arm(armSet[i]).locked, 0);
+            assertEq(_arm(armSet[i]).strikes, 0);
+        }
+        _balanced();
+        uint256 again = _post();
+        _fill(again);
+        assertEq(uint8(_job(again).phase), uint8(Arms.Phase.COMMIT));
+    }
+
+    function test_audit13_expiredTieSeedIsNotRedrawnAndTheDisputedKeySettlesUnresolved() public {
+        uint256 id = _pair();
+        address[] memory drawn = arms.armsOf(id);
+        bytes32[] memory a = _vals("truth");
+        bytes32[] memory b = _vals("truth");
+        b[2] = bytes32("other");
+        _commit(id, drawn[0], a);
+        _commit(id, drawn[1], b);
+        _reveal(id, drawn[0], a);
+        _reveal(id, drawn[1], b);
+        vm.roll(vm.getBlockNumber() + 1);
+        arms.settle(id);
+        Arms.Job memory j = _job(id);
+        assertEq(uint8(j.phase), uint8(Arms.Phase.TIE_OPEN));
+        assertEq(j.seedBlock, vm.getBlockNumber() + 1);
+        vm.roll(j.seedBlock + 257);
+        vm.expectRevert(Arms.SeedExpired.selector);
+        arms.draw(id);
+        assertEq(_job(id).tieBreaker, address(0));
+        assertEq(_job(id).seedBlock, j.seedBlock);
+        vm.expectRevert(Arms.TooEarly.selector);
+        arms.settle(id);
+        vm.warp(vm.getBlockTimestamp() + 1 days + 1);
+        arms.settle(id);
+        assertEq(uint8(_job(id).phase), uint8(Arms.Phase.SETTLED));
+        for (uint8 k; k < KEYS; ++k) {
+            (bytes32 value, Arms.Status st) = arms.results(id, k);
+            if (k == 2) {
+                assertEq(uint8(st), uint8(Arms.Status.UNRESOLVED));
+            } else {
+                assertEq(uint8(st), uint8(Arms.Status.AGREED));
+                assertEq(value, a[k]);
+            }
+        }
+        _balanced();
+    }
+
+    function test_audit13_replacementDrawHasOneSeedToo() public {
+        uint256 id = _pair();
+        address[] memory drawn = arms.armsOf(id);
+        _commit(id, drawn[0], _vals("truth"));
+        vm.warp(uint256(_job(id).deadline) + 1);
+        vm.roll(vm.getBlockNumber() + 1);
+        arms.timeout(id);
+        Arms.Job memory j = _job(id);
+        assertEq(uint8(j.phase), uint8(Arms.Phase.OPEN));
+        assertEq(j.seedBlock, vm.getBlockNumber() + 1);
+        assertEq(j.drawSeed, 0);
+        vm.roll(j.seedBlock + 257);
+        vm.expectRevert(Arms.SeedExpired.selector);
+        arms.draw(id);
+        assertEq(arms.armsOf(id).length, 1, "nobody was added");
+        vm.warp(vm.getBlockTimestamp() + 1 days + 1);
+        uint256 before = token.balanceOf(poster);
+        arms.cancel(id);
+        assertEq(token.balanceOf(poster) - before, 3 * FEE);
+        assertEq(_arm(drawn[0]).locked, 0, "the arm that committed is released");
+        assertEq(_arm(drawn[0]).strikes, 0);
+        assertEq(_arm(drawn[1]).strikes, 1);
+        _balanced();
+    }
+
+    function test_audit13_arbitrumExpiredSeedIsRefusedToo() public {
+        vm.chainId(4663);
+        vm.mockCall(address(100), abi.encodeCall(IArbSys.arbBlockNumber, ()), abi.encode(uint256(10_000)));
+        arms = _deploy(sepoliaParams(address(token), address(court)));
+        formId = arms.registerForm(keccak256("orbit form"), KEYS, "ipfs://orbit");
+        for (uint256 i; i < armSet.length; ++i) {
+            _fund(armSet[i], ARM_BOND);
+            vm.startPrank(armSet[i]);
+            arms.bond(ARM_BOND);
+            arms.serve(formId, FEE);
+            vm.stopPrank();
+        }
+        _fund(poster, 0);
+        vm.mockCall(address(100), abi.encodeCall(IArbSys.arbBlockNumber, ()), abi.encode(uint256(10_010)));
+        vm.prank(poster);
+        uint256 id = arms.post(formId, CHAIN, target, AT_BLOCK, FEE);
+        // 400 L2 blocks later ArbSys no longer serves block 10011: it reverts for it.
+        vm.mockCall(address(100), abi.encodeCall(IArbSys.arbBlockNumber, ()), abi.encode(uint256(10_410)));
+        vm.mockCallRevert(address(100), abi.encodeCall(IArbSys.arbBlockHash, (10_011)), "invalid block number");
+        vm.expectRevert(Arms.SeedExpired.selector);
+        arms.draw(id);
+        // Nor is a zero answer taken as a seed.
+        vm.mockCall(address(100), abi.encodeCall(IArbSys.arbBlockHash, (10_011)), abi.encode(bytes32(0)));
+        vm.expectRevert(Arms.SeedExpired.selector);
+        arms.draw(id);
+        assertEq(_job(id).seedBlock, 10_011);
+        assertEq(_job(id).drawSeed, 0);
+        assertEq(arms.armsOf(id).length, 0);
+    }
+
+    /// @dev One arm that commits and stays silent closes its own job with no answers. That must not
+    /// replace the verdict readers already have for the target.
+    function test_audit14_noShowCloseDoesNotReplaceTheLatestVerdict() public {
+        (uint256 first, bytes32[] memory v) = _settledJob();
+        (uint256 latestId,) = arms.latest(CHAIN, target, formId);
+        assertEq(latestId, first);
+        uint256 id = _pair();
+        address[] memory drawn = arms.armsOf(id);
+        _commit(id, drawn[0], v);
+        _commit(id, drawn[1], v);
+        _reveal(id, drawn[0], v);
+        vm.warp(uint256(_job(id).deadline) + 1);
+        arms.timeout(id);
+        assertEq(uint8(_job(id).phase), uint8(Arms.Phase.SETTLED));
+        for (uint8 k; k < KEYS; ++k) {
+            (, Arms.Status st) = arms.results(id, k);
+            assertEq(uint8(st), uint8(Arms.Status.UNRESOLVED), "the closed job itself has no answer");
+        }
+        Arms.Verdict memory lv;
+        (latestId, lv) = arms.latest(CHAIN, target, formId);
+        assertEq(latestId, first, "the earlier verdict is still the latest");
+        for (uint256 k; k < KEYS; ++k) {
+            assertEq(uint8(lv.statuses[k]), uint8(Arms.Status.AGREED));
+            assertEq(lv.values[k], v[k]);
+        }
+        // A missing tie breaker closes the same way and leaves the verdict alone as well.
+        uint256 tied = _tie();
+        vm.warp(uint256(_job(tied).deadline) + 1);
+        arms.timeout(tied);
+        (latestId,) = arms.latest(CHAIN, target, formId);
+        assertEq(latestId, first);
+        // A later job that carries answers does become the latest.
+        (uint256 third,) = _settledJob();
+        (latestId,) = arms.latest(CHAIN, target, formId);
+        assertEq(latestId, third);
+        _balanced();
+    }
 }

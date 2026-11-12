@@ -130,6 +130,13 @@ cannot opt out of an older job after its seed is visible. An already selected ar
 and locked tranche regardless of these later changes. Signer rotation does not change eligibility.
 
 The draw seed uses the block after posting/reopening and the job id. At the first draw it is saved.
+**One opening has one seed.** `draw` reverts `TooEarly` until that block is mined and `SeedExpired`
+once the chain no longer serves its hash (256 blocks later) with no seed saved. No other block is
+ever substituted: a caller would know that block's hash before sending, and could pick the arms, or
+a two-arm job instead of a spot check, by picking the block. A job posted and never drawn in that
+time is refunded by `cancel` after the fill deadline and can be posted again; a tie break never drawn
+is closed by `settle` after the fill deadline with its disputed keys UNRESOLVED. A seed that was
+saved never expires, so a partly filled job keeps drawing from it.
 Each attempt selects `keccak256(abi.encode(seed, attempt)) % serverCount`; the counter advances even
 when that index is ineligible. Calls take at most **32 attempts** and retain the same seed/counter
 between calls. There is no scan over the full form list, candidate compaction or modulo-zero path.
@@ -173,7 +180,9 @@ Anyone may `draw`, `timeout`, `cancel`, `settle`, `resolve` or `release`.
   tranches. When multiple arms miss, they share this debit equally, with integer dust assigned to
   the first missing arm in the job roster. At most two fees are taken in total, below one tranche.
   Each missing arm receives a strike; timely revealers do not. Every tranche is unlocked, the job is
-  SETTLED and already released, and no key is challengeable. Escrow `spent` stays zero; the separate
+  SETTLED and already released, and no key is challengeable. A job closed this way carries no
+  answer, so it is **not** recorded as the target's latest verdict: `latest()` keeps returning the
+  last job that settled with answers, and one silent arm cannot erase it. Escrow `spent` stays zero; the separate
   `NoShowCompensation` event records each bond debit. This is the only bond reduction besides a ruled
   challenge (apart from an arm withdrawing its own unlocked bond).
 - The same closure applies when an assigned tie breaker misses commit or reveal, because the main
@@ -217,10 +226,22 @@ Other retained assumptions and operational responsibilities:
   owner may mint test tokens freely; that trust is outside Arms. The court and fee token must match
   their documented interfaces. Core token calls remain transfer, transferFrom, balanceOf and burn;
   exact court-fee approval is the separate fee-asset path.
-- Block-hash randomness is **not VRF randomness**. A proposer/sequencer can bias it; if the initial
-  seed hash expires before anyone draws, the existing v1 fallback uses the newest previous block.
-  Later calls cannot change a captured seed. Fixed indices remove list reshaping, but cannot remove
-  proposer bias, sybil ownership or competition from other jobs for unlocked capacity.
+- Block-hash randomness is **not VRF randomness**. A proposer/sequencer can bias the one seed block.
+  Nobody else can: an expired seed is never replaced, and later calls cannot change a saved seed.
+  Fixed indices remove list reshaping, but cannot remove proposer bias, sybil ownership or
+  competition from other jobs for unlocked capacity.
+- **Somebody must call `draw` within 256 blocks of the seed block**, which is the block after
+  `post`, after a commit no-show replacement (`timeout`) and after `settle` opens a tie break. That
+  is about 51 minutes on Ethereum or Sepolia and about one minute on an Arbitrum Orbit chain with
+  250 ms blocks (the chain's own block numbers are read from ArbSys there). The poster, any arm or
+  any keeper may call it; a poster should send `draw` right after `post`. Missing the window costs
+  time, never funds: the escrow comes back through `cancel` one day after posting. A poster can
+  still post several jobs and prefer one; every posted job can be drawn by anyone and then costs
+  its fees.
+- With two arms, a key where one arm answers UNKNOWN and the other a value has one vote: it is
+  UNRESOLVED without a tie break, the abstaining arm is not struck and the answering arm earns
+  nothing for that key. UNKNOWN is an abstention by design; accepted for v1. Readers should treat an
+  UNRESOLVED key as "no answer", not as a negative answer.
 - Registering forms and holding a lifetime server index do not prove identity. Stale server entries
   can make filling sparse pools expensive across many bounded calls. Keepers must progress jobs or
   cancel/settle at deadlines. Posting and then timing out can temporarily lock capacity for gas cost.

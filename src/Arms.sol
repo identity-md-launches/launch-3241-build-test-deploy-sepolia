@@ -163,6 +163,7 @@ contract Arms {
     error WrongPhase();
     error TooEarly();
     error TooLate();
+    error SeedExpired();
     error NotOnJob();
     error AlreadyCommitted();
     error NotCommitted();
@@ -456,6 +457,11 @@ contract Arms {
 
     /// @notice At most MAX_DRAW_TRIES attempts over the posting-time list length, with stable indices.
     /// Skips ineligible entries without rebuilding the list. Repeated calls continue the same sequence.
+    /// @dev One opening has one seed: the hash of `seedBlock`, fixed when the job was posted or
+    /// reopened and saved by the first call. If nobody draws while the chain still serves that hash
+    /// (256 blocks), the opening can no longer be drawn: no other block is ever substituted, because
+    /// the caller would know its hash before sending. An OPEN job is then refunded by `cancel`, and a
+    /// tie break is closed by `settle`, both after `fillDeadline`.
     function draw(uint256 jobId) external {
         Job storage j = jobs[jobId];
         if (j.phase != Phase.OPEN && j.phase != Phase.TIE_OPEN) revert WrongPhase();
@@ -464,10 +470,7 @@ contract Arms {
             uint256 n = Blocks.number(arbitrumBlocks);
             if (n <= j.seedBlock) revert TooEarly();
             bytes32 h = Blocks.hash(j.seedBlock, arbitrumBlocks);
-            if (h == bytes32(0)) {
-                j.seedBlock = n - 1;
-                h = Blocks.hash(n - 1, arbitrumBlocks);
-            }
+            if (h == bytes32(0)) revert SeedExpired();
             j.drawSeed = uint256(keccak256(abi.encode(h, jobId, uint256(0))));
         }
         bool tie = j.phase == Phase.TIE_OPEN;
@@ -491,7 +494,8 @@ contract Arms {
         }
     }
 
-    /// @notice Refunds a job that was not filled (or whose tie break arm was not found) by `fillDeadline`.
+    /// @notice Refunds a job that was not filled by `fillDeadline`, including one whose seed expired
+    /// before anyone drew. Arms already drawn for it are unlocked.
     function cancel(uint256 jobId) external {
         Job storage j = jobs[jobId];
         if (j.phase != Phase.OPEN) revert WrongPhase();
@@ -638,7 +642,8 @@ contract Arms {
         j.phase = Phase.SETTLED;
         j.released = true;
         j.challengeEnd = uint64(block.timestamp);
-        latestJob[j.targetChainId][j.target][j.formId] = jobId;
+        // Not recorded as the target's latest verdict: this job carries no answer, and one arm that
+        // stays silent must not be able to replace an earlier verdict with nothing.
         uint256 refund = j.escrow;
         j.escrow = 0;
         totalEscrow -= refund;
